@@ -59,7 +59,27 @@ def _connect(db_path=None) -> sqlite3.Connection:
         raise OrderBookNotSeededError(
             f"Order tables missing in {path}. Run: python seed_data.py --reset"
         ) from exc
+    _ensure_delivery_columns(conn)
     return conn
+
+
+# Delivery-detail columns were added after the first seed; ALTER an old database
+# in place so a draft can actually carry the address fields the customer gave us.
+NON_SEED_DELIVERY_COLUMNS = (
+    ("delivery_recipient", "TEXT"),
+    ("delivery_address", "TEXT"),
+    ("delivery_postal", "TEXT"),
+    ("delivery_contact", "TEXT"),
+)
+
+
+def _ensure_delivery_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+    }
+    for name, kind in NON_SEED_DELIVERY_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {kind}")
 
 
 def _now() -> str:
@@ -191,6 +211,7 @@ def create_draft_order(
     fulfillment_method: str | None = None,
     shipping_usd: float = 0.0,
     eta_date: str | None = None,
+    delivery: dict[str, str] | None = None,
     db_path=None,
 ) -> dict[str, Any]:
     """Create an `awaiting_payment` order from [{sku, quantity}] using catalog prices.
@@ -198,7 +219,8 @@ def create_draft_order(
     When a warehouse + fulfillment method is given, the real shipping cost and
     ETA are taken from the seeded ``fulfillment_options`` table so the draft
     always matches the catalog quote; ``shipping_usd`` is only a fallback if no
-    matching option exists.
+    matching option exists. ``delivery`` carries the customer-supplied slots
+    (recipient, address, postal, contact) so a draft update actually persists.
     """
     if not items:
         raise ValueError("create_draft_order requires at least one item")
@@ -233,6 +255,7 @@ def create_draft_order(
             )
 
         subtotal = round(sum(i["unit_price_usd"] * i["quantity"] for i in priced), 2)
+        delivery = delivery or {}
         now = _now()
         order_id = f"AM-ORD-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:4].upper()}"
         order = {
@@ -249,15 +272,19 @@ def create_draft_order(
             "shipping_usd": shipping,
             "total_usd": round(subtotal + shipping, 2),
         }
+        for key in ("recipient", "address", "postal", "contact"):
+            order[f"delivery_{key}"] = (delivery or {}).get(key)
 
         with conn:
             conn.execute(
                 "INSERT INTO orders (order_id, customer_id, status, placed_at, updated_at,"
                 " warehouse, fulfillment_method, tracking_ref, eta_date,"
-                " subtotal_usd, shipping_usd, total_usd)"
+                " subtotal_usd, shipping_usd, total_usd,"
+                " delivery_recipient, delivery_address, delivery_postal, delivery_contact)"
                 " VALUES (:order_id, :customer_id, :status, :placed_at, :updated_at,"
                 " :warehouse, :fulfillment_method, :tracking_ref, :eta_date,"
-                " :subtotal_usd, :shipping_usd, :total_usd)",
+                " :subtotal_usd, :shipping_usd, :total_usd,"
+                " :delivery_recipient, :delivery_address, :delivery_postal, :delivery_contact)",
                 order,
             )
             conn.executemany(
@@ -268,6 +295,41 @@ def create_draft_order(
         return _attach_detail(conn, dict(order))
     finally:
         conn.close()
+
+
+DELIVERY_SLOTS = ("recipient", "address", "postal", "contact")
+
+
+def update_draft_delivery(
+    order_id: str, delivery: dict[str, str], db_path=None
+) -> dict[str, Any]:
+    """Persist the customer-supplied delivery slots onto an open draft.
+
+    Only slots actually supplied are written; any slot not in ``delivery`` is
+    left as it was, so a partial update never blanks data the customer already
+    gave. Raises ``OrderNotFoundError`` if there is no open draft for that id.
+    """
+    conn = _connect(db_path)
+    try:
+        slots = {key: delivery.get(key) for key in DELIVERY_SLOTS if delivery.get(key)}
+        if not slots:
+            raise ValueError("update_draft_delivery requires at least one delivery slot")
+        assignments = ", ".join(f"delivery_{key} = :delivery_{key}" for key in slots)
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE orders SET updated_at = :updated_at, {assignments}"
+                " WHERE order_id = :order_id AND status IN ('draft', 'awaiting_payment')",
+                {
+                    "updated_at": _now(),
+                    "order_id": order_id,
+                    **{f"delivery_{key}": value for key, value in slots.items()},
+                },
+            )
+        if cursor.rowcount == 0:
+            raise OrderNotFoundError(f"No open draft: {order_id}")
+    finally:
+        conn.close()
+    return get_order(order_id, db_path=db_path)
 
 
 def set_order_status(order_id: str, status: str, db_path=None) -> dict[str, Any]:
@@ -375,6 +437,17 @@ def format_order(order: dict[str, Any]) -> str:
         f"{payment['status']} ${payment['amount_usd']:.2f} ({payment['processor_ref']})"
         for payment in order.get("payments", [])
     ) or "none"
+    delivery_slots = {
+        "recipient": order.get("delivery_recipient"),
+        "address": order.get("delivery_address"),
+        "postal": order.get("delivery_postal"),
+        "contact": order.get("delivery_contact"),
+    }
+    recorded_delivery = ", ".join(
+        f"{key} {value}"
+        for key, value in delivery_slots.items()
+        if value is not None and str(value).strip()
+    )
     return (
         f"- {order['order_id']} | status {order['status']}"
         f" | placed {order['placed_at']} | updated {order['updated_at']}\n"
@@ -385,6 +458,7 @@ def format_order(order: dict[str, Any]) -> str:
         f" from {order['warehouse'] or 'unassigned'}"
         f" | tracking {order['tracking_ref'] or 'none'}"
         f" | eta {order['eta_date'] or 'tbd'}\n"
+        f"    delivery: {recorded_delivery or 'not provided'}\n"
         f"    payments: {payments}\n"
         f"    items:\n{items}"
     )

@@ -30,6 +30,7 @@ from orders import (
     get_customer,
     get_order,
     list_orders,
+    update_draft_delivery,
 )
 
 # A2A server requests the graph in its own process. Setting up logging at import
@@ -86,6 +87,8 @@ class AgentMartState(TypedDict, total=False):
     payment_result: str
     draft_order: dict[str, Any]
     payment_receipt: dict[str, Any]
+    delivery_details: dict[str, str]
+    missing_delivery_slots: list[str]
     transcript: Annotated[list[dict[str, Any]], operator.add]
 
 
@@ -395,6 +398,83 @@ def extract_sku(customer_request: str) -> str | None:
 def extract_order_id(customer_request: str) -> str | None:
     match = ORDER_ID_PATTERN.search(customer_request)
     return match.group(0).upper() if match else None
+
+
+# Delivery slots a checkout draft should collect before it is paid. The Order
+# Agent may still confirm a draft while some are missing, but it must NOT call
+# the Payment Agent short of a full set -- it has to ask for the rest instead.
+REQUIRED_DELIVERY_SLOTS = ("recipient", "address", "postal", "contact")
+
+DELIVERY_SLOT_LABELS = {
+    "recipient": "recipient name",
+    "address": "full delivery address",
+    "postal": "postal code",
+    "contact": "contact number",
+}
+
+
+def extract_delivery_details(text: str) -> dict[str, str]:
+    """Pull the customer-supplied delivery slots out of a request.
+
+    Remote peers phrase these loosely ("address line '3 Pine Grove'", "recipient
+    Ang Chin Tiong", "contact number 97492736", "postal code 597590"), so each
+    slot is captured from a keyword up to the next comma, then trimmed of the
+    surrounding quotes the peer used.
+    """
+    details: dict[str, str] = {}
+
+    def _after(keyword: str) -> str:
+        match = re.search(
+            rf"\b{keyword}\b[^A-Za-z0-9]{{0,8}}([A-Za-z0-9][^,;]*)",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        value = match.group(1).strip()
+        value = re.split(r"\.\s+\w", value, maxsplit=1)[0]
+        value = value.split(" and ")[0]
+        value = re.sub(r"[^A-Za-z0-9\s'\"-]+$", "", value).strip().strip("'\" ").strip()
+        if len(value) > 48:
+            value = value[:48].rsplit(" ", 1)[0]
+        return value
+
+    for slot, keywords in (
+        ("recipient", ("recipient", "recipient name", "deliver to", "ship to", "send to")),
+        ("address", ("address line", "delivery address", "shipping to", "send to", "address")),
+        ("contact", ("contact number", "contact", "phone number", "phone")),
+        ("postal", ("postal code", "postal", "postcode")),
+    ):
+        raw = ""
+        for keyword in keywords:
+            raw = _after(keyword)
+            if raw:
+                break
+        if not raw:
+            continue
+        if slot == "contact":
+            match = re.search(r"([89][0-9]{7})", raw)
+            details[slot] = match.group(1) if match else raw
+        elif slot == "postal":
+            match = re.search(r"([0-9]{6})", raw)
+            details[slot] = match.group(1) if match else raw
+        else:
+            details[slot] = raw
+
+    if "recipient" not in details:
+        match = re.search(r"\bfor ([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)(?:\s+[A-Z][A-Za-z'-]+)?)\b", text)
+        if match:
+            details["recipient"] = match.group(1)
+    if "contact" not in details:
+        match = re.search(r"\b([89][0-9]{7})\b", text)
+        if match:
+            details["contact"] = match.group(1)
+    if "postal" not in details:
+        match = re.search(r"\b([0-9]{6})\b", text)
+        if match:
+            details["postal"] = match.group(1)
+
+    return details
 
 
 def load_order_context(customer_id: str, order_id: str | None = None) -> str:
@@ -742,12 +822,24 @@ def _order_agent_prompt(state: AgentMartState) -> str:
             {
                 **common,
                 "draft_order": state.get("draft_order", {}),
+                "delivery_details": state.get("delivery_details", {}),
+                "missing_delivery_slots": state.get("missing_delivery_slots", []),
                 "inventory_result": state.get("inventory_result", "(agent not on this path)"),
                 "fulfillment_result": state.get("fulfillment_result", "(agent not on this path)"),
                 "instruction": (
                     "A draft order has been created and is awaiting payment. Confirm back to the "
                     "customer what is reserved, the line items, the total, and the delivery path. "
-                    "State clearly that nothing is charged until they confirm checkout."
+                    "State clearly that nothing is charged until they confirm checkout.\n"
+                    "Delivery details are REQUIRED before checkout: "
+                    + ", ".join(
+                        DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS
+                    )
+                    + ".\n"
+                    "The slots the customer has already given are listed in delivery_details; "
+                    "the slots still missing are listed in missing_delivery_slots. "
+                    "If any required slot is missing, clearly ASK the customer for exactly the "
+                    "missing ones (use the labels above) and do NOT present the draft as a "
+                    "confirmed order ready to pay until every slot is present. Say what is missing."
                 ),
             },
             indent=2,
@@ -784,6 +876,31 @@ def _order_agent_prompt(state: AgentMartState) -> str:
     )
 
 
+def _persist_delivery_details(
+    state: AgentMartState,
+    draft: dict[str, Any],
+    customer_id: str,
+) -> dict[str, Any]:
+    """Extract delivery slots from the incoming request and persist them.
+
+    Returns the refreshed draft. Anything the customer supplied is written even
+    if slots are still missing; the caller records what is outstanding so the
+    prompt can tell the Order Agent to ask for it.
+    """
+    request_text = state.get("customer_request") or ""
+    if not request_text:
+        task = state.get("a2a_task") or {}
+        request_text = (task.get("payload") or {}).get("customer_request") or ""
+    provided = extract_delivery_details(request_text)
+    if not provided:
+        return draft
+    try:
+        return update_draft_delivery(draft["order_id"], provided, db_path=None)
+    except Exception as exc:  # never fail the hop because a slot could not be written
+        log.error("order_agent: delivery persist failed for %s: %s", draft["order_id"], exc)
+        return draft
+
+
 def order_agent_node(state: AgentMartState) -> AgentMartState:
     """Order Agent. Reads the order book; creates a draft order on a purchase intent."""
     intent = state.get("intent", "product_advice")
@@ -803,6 +920,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     # A purchase intent materialises a real draft order before the model speaks.
     if intent == "purchase_intent":
         sku = state.get("target_sku")
+        draft = None
         if not sku:
             open_drafts = sorted(
                 (
@@ -814,9 +932,6 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
             )
             if open_drafts:
                 draft = open_drafts[0]
-                next_state["draft_order"] = draft
-                next_state["target_order_id"] = draft["order_id"]
-                next_state["order_context"] = format_order(draft)
                 log.info(
                     "order_agent: refreshed newest open draft %s (no sku named, customer=%s)",
                     draft["order_id"], customer_id,
@@ -843,13 +958,33 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                         warehouse="SG-CENTRAL",
                         fulfillment_method="standard_delivery",
                     )
-                next_state["draft_order"] = draft
-                next_state["target_order_id"] = draft["order_id"]
-                next_state["order_context"] = format_order(draft)
-                log.info("order_agent: drafted %s for sku=%s customer=%s", draft["order_id"], sku, customer_id)
+                    log.info("order_agent: drafted %s for sku=%s customer=%s", draft["order_id"], sku, customer_id)
             except (CatalogNotSeededError, OrderBookNotSeededError, ValueError) as exc:
                 next_state["draft_order"] = {"error": f"{type(exc).__name__}: {exc}"}
                 log.error("order_agent: draft failed for sku=%s: %s", sku, exc)
+
+        if draft:
+            draft = _persist_delivery_details(
+                state, draft, customer_id=customer_id
+            )
+            next_state["draft_order"] = draft
+            next_state["target_order_id"] = draft["order_id"]
+            next_state["order_context"] = format_order(draft)
+            next_state["delivery_details"] = {
+                key: draft.get(f"delivery_{key}")
+                for key in REQUIRED_DELIVERY_SLOTS
+                if draft.get(f"delivery_{key}")
+            }
+            next_state["missing_delivery_slots"] = [
+                key for key in REQUIRED_DELIVERY_SLOTS
+                if not (draft.get(f"delivery_{key}") or "").strip()
+            ]
+            log.info(
+                "order_agent: draft %s delivery_see=%s missing=%s",
+                draft["order_id"],
+                ",".join(next_state["delivery_details"]) or "-",
+                ",".join(next_state["missing_delivery_slots"]) or "-",
+            )
 
     # A bare "checkout and pay" resolves to the customer's oldest unpaid order.
     if intent == "checkout_payment" and not next_state.get("target_order_id"):
@@ -891,7 +1026,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     # Only the keys this node actually decided; transcript/a2a_log go back as deltas.
     delta: AgentMartState = {
         k: v for k, v in next_state.items()
-        if k in ("draft_order", "target_order_id", "order_context")
+        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots")
     }
     delta["transcript"] = [transcript_entry("order_agent", result, envelope)]
     delta["a2a_log"] = [envelope, done]

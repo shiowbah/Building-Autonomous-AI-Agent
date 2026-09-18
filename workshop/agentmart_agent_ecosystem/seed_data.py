@@ -99,7 +99,11 @@ CREATE TABLE IF NOT EXISTS orders (
     eta_date           TEXT,
     subtotal_usd       REAL NOT NULL,
     shipping_usd       REAL NOT NULL,
-    total_usd          REAL NOT NULL
+    total_usd          REAL NOT NULL,
+    delivery_recipient TEXT,
+    delivery_address   TEXT,
+    delivery_postal    TEXT,
+    delivery_contact   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (

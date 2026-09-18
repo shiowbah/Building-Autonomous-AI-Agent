@@ -310,6 +310,101 @@ def run_draft_refresh(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[s
     if draft_id:
         persisted = get_order(draft_id)
         checks.append(expect("the draft is still awaiting_payment", persisted["status"] == "awaiting_payment"))
+        checks.append(
+            expect(
+                "delivery slots persisted on the draft",
+                (
+                    persisted.get("delivery_recipient") == "Ang Chin Tiong"
+                    and persisted.get("delivery_address") == "3 Pine Grove"
+                    and persisted.get("delivery_postal") == "597590"
+                    and persisted.get("delivery_contact") == "97492736"
+                ),
+            )
+        )
+        checks.append(
+            expect(
+                "no required delivery slot is outstanding after the full update",
+                not second.get("missing_delivery_slots"),
+            )
+        )
+
+    return checks, second
+
+
+def run_draft_needs_fields(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """Partial delivery details persist, name what is still missing, then clear."""
+    first = run_agentmart(
+        "I want to buy this AM-EAR-1002. recipient 'Ang Chin Tiong', address '3 Pine Grove'.",
+        dry_run=dry_run,
+        channel="telegram",
+    )
+    draft_id = first.get("draft_order", {}).get("order_id")
+
+    missing_first = sorted(first.get("missing_delivery_slots") or [])
+
+    second = run_agentmart(
+        ("Update the draft order with the remaining delivery details: postal code "
+         "597590, contact number '97492736'. Do not place the order, authorize "
+         "payment, or capture funds."),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 1 persisted the slots that were given", bool(first.get("delivery_details"))),
+        expect(
+            "turn 1 named the missing required slots",
+            sorted(first.get("missing_delivery_slots") or []) == ["contact", "postal"],
+        ),
+    ]
+    if draft_id:
+        first_persisted = get_order(draft_id)
+        checks.append(
+            expect(
+                "partial slots were saved on the draft",
+                first_persisted.get("delivery_recipient") == "Ang Chin Tiong"
+                and first_persisted.get("delivery_address") == "3 Pine Grove",
+            )
+        )
+        checks.append(
+            expect(
+                "the still-missing slots were not fabricated",
+                missing_first == ["contact", "postal"],
+            )
+        )
+        checks.append(
+            expect("turn 2 routed to drafting, not checkout_payment", second.get("intent") == "purchase_intent"),
+        )
+        checks.append(
+            expect("turn 2 reused the same draft id", second.get("draft_order", {}).get("order_id") == draft_id),
+        )
+        checks.append(
+            expect("turn 2 did NOT run the payment agent", "payment_agent" not in agents_visited(second)),
+        )
+        checks.append(
+            expect(
+                "turn 2 cleared the outstanding slots",
+                not second.get("missing_delivery_slots"),
+            )
+        )
+        second_persisted = get_order(draft_id)
+        checks.append(
+            expect(
+                "full delivery details are now persisted",
+                second_persisted.get("delivery_recipient") == "Ang Chin Tiong"
+                and second_persisted.get("delivery_address") == "3 Pine Grove"
+                and second_persisted.get("delivery_postal") == "597590"
+                and second_persisted.get("delivery_contact") == "97492736",
+            )
+        )
+        checks.append(
+            expect(
+                "no payment was captured while updating",
+                first.get("draft_order", {}).get("status") == "awaiting_payment"
+                and second_persisted["status"] == "awaiting_payment",
+            )
+        )
 
     return checks, second
 
@@ -428,6 +523,7 @@ def main() -> int:
             print(f"{scenario.name:<24} {scenario.intent:<17} {scenario.request}")
         print(f"{'buy-then-checkout':<24} {'(chained)':<17} purchase a SKU, then settle that order")
         print(f"{'draft-refresh':<24} {'(chained)':<17} re-quote a draft: reused, never charged")
+        print(f"{'draft-needs-fields':<24} {'(chained)':<17} partial delivery: ask, then complete the draft")
         print(f"{'intent-routing':<24} {'(routing)':<17} phrasings, human and agent-generated")
         return 0
 
@@ -436,7 +532,7 @@ def main() -> int:
     run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        known_chained = {"buy-then-checkout", "draft-refresh"}
+        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields"}
         unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -485,6 +581,12 @@ def main() -> int:
             run_draft_refresh,
             "Buy AM-EAR-1002 -> update the checkout draft with delivery details.",
             "Re-quoting a draft reuses the draft and never charges.",
+        ),
+        (
+            "draft-needs-fields",
+            run_draft_needs_fields,
+            "Buy AM-EAR-1002 -> complete the delivery details.",
+            "Missing delivery slots are named, then a full update clears them.",
         ),
     ]
     for name, fn, request, describes in chained:
