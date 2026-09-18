@@ -599,9 +599,20 @@ def hermes_myshopper_node(state: AgentMartState) -> AgentMartState:
     }
     # Order and Payment agents read the customer's real order book.
     if intent in ("order_status", "checkout_payment", "purchase_intent"):
-        next_state["order_context"] = load_order_context(
-            customer_id, envelope["payload"]["target_order_id"]
+        # A status lookup gets the FULL book (plus nails the named order) so a
+        # peer that says "check order X" still can't hide the customer's other
+        # orders, like a recent draft. Checkout/payment narrow to one order.
+        order_context = load_order_context(
+            customer_id,
+            None if intent == "order_status" else envelope["payload"]["target_order_id"],
         )
+        if intent == "order_status" and envelope["payload"]["target_order_id"]:
+            requested = envelope["payload"]["target_order_id"]
+            in_book = requested in order_context
+            order_context += "\n(requested order id: " + requested + ")"
+            if not in_book:
+                order_context += "\n**Note: order " + requested + " does not appear in the customer's order book.**"
+        next_state["order_context"] = order_context
     return next_state
 
 
@@ -710,9 +721,14 @@ def _order_agent_prompt(state: AgentMartState) -> str:
                 "order_book": state.get("order_context", ""),
                 "instruction": (
                     "Answer the customer's order-status question from the order book. "
-                    "For each relevant order give: order id, status, what happens next, "
-                    "tracking reference and ETA when present. Flag any order that is "
-                    "awaiting payment as needing the customer's action."
+                    "If the request names a specific order id, focus on it, but still "
+                    "report every OTHER order in the book in one line each. If no order "
+                    "id is named, every order in the book is relevant: report each one "
+                    "with order id, items, status, total, tracking/ETA when present, and "
+                    "what the customer should do next (for example, a draft awaiting "
+                    "payment needs a checkout step). Zero in on any order that contains "
+                    "a SKU or product the customer mentioned. Never skip or merge orders "
+                    "just because one order id was emphasized in the request."
                 ),
             },
             indent=2,
