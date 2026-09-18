@@ -178,13 +178,23 @@ def list_orders(
 
 
 def find_payable_order(customer_id: str, db_path=None) -> dict[str, Any] | None:
-    """The order a bare 'checkout and pay' should act on: oldest unpaid one."""
+    """The order a bare 'checkout and pay' should act on.
+
+    Prefer the customer's most recent open draft (the thing they were just
+    working on), falling back to the oldest unpaid order so behaviour stays
+    deterministic on a freshly seeded book.
+    """
     candidates = [
         order
         for order in list_orders(customer_id=customer_id, db_path=db_path)
         if order["status"] in ("draft", "awaiting_payment") and not order["is_paid"]
     ]
-    return sorted(candidates, key=lambda o: o["placed_at"])[0] if candidates else None
+    if not candidates:
+        return None
+    sorted_candidates = sorted(
+        candidates, key=lambda o: (o["placed_at"], o["order_id"]), reverse=True
+    )
+    return sorted_candidates[0]
 
 
 def find_open_draft(customer_id: str, sku: str, db_path=None) -> dict[str, Any] | None:
@@ -330,6 +340,65 @@ def update_draft_delivery(
     finally:
         conn.close()
     return get_order(order_id, db_path=db_path)
+
+
+def missing_delivery_slots(order: dict[str, Any]) -> list[str]:
+    """Delivery slots a stored order still needs before it can be checked out."""
+    return [
+        key
+        for key in DELIVERY_SLOTS
+        if not (order.get(f"delivery_{key}") or "").strip()
+    ]
+
+
+def refund_payment(payment_id: str, db_path=None) -> dict[str, Any]:
+    """Reverse a captured payment and put the order back to `awaiting_payment`.
+
+    Purely simulated like everything else here: the payment row is marked
+    ``refunded`` and the order status returns to ``awaiting_payment`` so it can
+    be rechecked or paid again.
+    """
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM payments WHERE payment_id = ?", (payment_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"No such payment: {payment_id}")
+        payment = dict(row)
+        if payment["status"] == "refunded":
+            return payment
+        if payment["status"] != "captured":
+            raise ValueError(f"Payment {payment_id} is {payment['status']}, not captured")
+        with conn:
+            conn.execute(
+                "UPDATE payments SET status = 'refunded' WHERE payment_id = ?",
+                (payment_id,),
+            )
+            conn.execute(
+                "UPDATE orders SET status = 'awaiting_payment', updated_at = ?"
+                " WHERE order_id = ?",
+                (_now(), payment["order_id"]),
+            )
+        payment.update(status="refunded")
+    finally:
+        conn.close()
+    return payment
+
+
+def refund_order(order_id: str, db_path=None) -> list[dict[str, Any]]:
+    """Refund every captured payment on an order; the order returns to open."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM payments WHERE order_id = ? AND status = 'captured'",
+            (order_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        raise ValueError(f"No captured payment to refund on {order_id}")
+    return [refund_payment(row["payment_id"], db_path=db_path) for row in rows]
 
 
 def set_order_status(order_id: str, status: str, db_path=None) -> dict[str, Any]:

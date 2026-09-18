@@ -30,6 +30,8 @@ from orders import (
     get_customer,
     get_order,
     list_orders,
+    missing_delivery_slots,
+    refund_order,
     update_draft_delivery,
 )
 
@@ -89,6 +91,7 @@ class AgentMartState(TypedDict, total=False):
     payment_receipt: dict[str, Any]
     delivery_details: dict[str, str]
     missing_delivery_slots: list[str]
+    checkout_blocked_reason: str
     transcript: Annotated[list[dict[str, Any]], operator.add]
 
 
@@ -846,14 +849,24 @@ def _order_agent_prompt(state: AgentMartState) -> str:
         )
 
     if intent == "checkout_payment":
+        blocked = state.get("checkout_blocked_reason") or state.get("missing_delivery_slots")
         return json.dumps(
             {
                 **common,
                 "order_book": state.get("order_context", ""),
                 "order_to_settle": state.get("target_order_id"),
+                "delivery_details": state.get("delivery_details", {}),
+                "missing_delivery_slots": state.get("missing_delivery_slots", []),
+                "checkout_blocked_reason": state.get("checkout_blocked_reason", ""),
                 "instruction": (
-                    "Identify the single order to settle and restate its total and payment method "
-                    "for confirmation. Do not claim payment has happened: the Payment Agent runs next."
+                    "Resolve the single order the customer wants to settle and restate its "
+                    "total, items, and payment method for confirmation. Do not claim payment "
+                    "has happened: the Payment Agent runs next.\n"
+                    "If checkout_blocked_reason is set, the order may NOT be settled yet: tell "
+                    "the customer honestly that payment cannot proceed because the required "
+                    "delivery details are incomplete, and ASK for exactly the slots listed in "
+                    "missing_delivery_slots (recipient name, full delivery address, postal "
+                    "code, contact number). There is no charge until they provide them."
                 ),
             },
             indent=2,
@@ -986,15 +999,48 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                 ",".join(next_state["missing_delivery_slots"]) or "-",
             )
 
-    # A bare "checkout and pay" resolves to the customer's oldest unpaid order.
-    if intent == "checkout_payment" and not next_state.get("target_order_id"):
-        try:
-            payable = find_payable_order(customer_id)
-            if payable:
-                next_state["target_order_id"] = payable["order_id"]
-                next_state["order_context"] = format_order(payable)
-        except OrderBookNotSeededError as exc:
-            next_state["order_context"] = f"(order book unavailable: {exc})"
+    # A bare "checkout and pay" resolves to the customer's newest open draft,
+    # then delivery completeness gates whether the Payment Agent may run.
+    if intent == "checkout_payment":
+        target_id = next_state.get("target_order_id")
+        if not target_id:
+            try:
+                payable = find_payable_order(customer_id)
+                if payable:
+                    next_state["target_order_id"] = payable["order_id"]
+                    target_id = payable["order_id"]
+                    next_state["order_context"] = format_order(payable)
+            except OrderBookNotSeededError as exc:
+                next_state["order_context"] = f"(order book unavailable: {exc})"
+
+        if target_id:
+            try:
+                target = get_order(target_id)
+            except OrderNotFoundError:
+                target = None
+            if target:
+                next_state["order_context"] = format_order(target)
+                provided = {
+                    key: target.get(f"delivery_{key}")
+                    for key in REQUIRED_DELIVERY_SLOTS
+                    if (target.get(f"delivery_{key}") or "").strip()
+                }
+                missing = missing_delivery_slots(target)
+                next_state["delivery_details"] = provided
+                next_state["missing_delivery_slots"] = missing
+                if missing:
+                    next_state["checkout_blocked_reason"] = (
+                        "checkout refused: order " + target_id
+                        + " is missing required delivery details: "
+                        + ", ".join(DELIVERY_SLOT_LABELS[key] for key in missing)
+                        + ". The customer must provide them before any payment is attempted."
+                    )
+                    log.info(
+                        "order_agent: checkout blocked for %s (missing=%s)",
+                        target_id, ",".join(missing),
+                    )
+                else:
+                    next_state["checkout_blocked_reason"] = ""
 
     client = OpenRouterHermesClient(
         dry_run=state.get("dry_run", False),
@@ -1026,7 +1072,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     # Only the keys this node actually decided; transcript/a2a_log go back as deltas.
     delta: AgentMartState = {
         k: v for k, v in next_state.items()
-        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots")
+        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots", "checkout_blocked_reason")
     }
     delta["transcript"] = [transcript_entry("order_agent", result, envelope)]
     delta["a2a_log"] = [envelope, done]
@@ -1038,7 +1084,11 @@ PAYMENT_AGENT_SYSTEM_PROMPT = (
     "You are the AgentMart Payment Agent. Payments in this workshop are SIMULATED: "
     "the receipt you are given was written to a local database and no payment processor "
     "was contacted. Confirm the settled order back to Hermes/MyShopper using only the "
-    "receipt values, and state plainly that this was a simulated payment."
+    "receipt values, and state plainly that this was a simulated payment.\n"
+    "If the receipt has status 'blocked', NO payment was made: no authorization, no "
+    "capture, nothing. Report the blocking reason from the receipt and the missing "
+    "delivery details the customer still owes, and say there is no charge yet. Never "
+    "describe a blocked receipt as a completed or simulated payment."
 )
 
 
@@ -1060,6 +1110,18 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
     if not order_id:
         receipt = {"error": "no payable order found for this customer"}
         log.warning("payment_agent: checkout_payment with no target_order_id")
+    elif state.get("checkout_blocked_reason"):
+        receipt = {
+            "status": "blocked",
+            "order_id": order_id,
+            "reason": state["checkout_blocked_reason"],
+            "missing_delivery_slots": state.get("missing_delivery_slots", []),
+            "simulated": True,
+        }
+        log.info(
+            "payment_agent: refused to settle %s — delivery details incomplete",
+            order_id,
+        )
     else:
         try:
             settled = checkout_and_pay(order_id)

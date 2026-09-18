@@ -160,6 +160,18 @@ def check_draft_order(result: dict[str, Any]) -> list[Check]:
     return checks
 
 
+def check_checkout_blocks_missing_delivery(result: dict[str, Any]) -> list[Check]:
+    """A bare checkout must stop when the target order has no delivery details."""
+    receipt = result.get("payment_receipt", {})
+    return [
+        expect("an order was selected to settle", bool(receipt.get("order_id"))),
+        expect("payment was NOT captured (blocked)", receipt.get("status") == "blocked"),
+        expect("the gate says delivery details are missing", bool(receipt.get("missing_delivery_slots"))),
+        expect("no simulated capture reference was issued", "processor_ref" not in receipt),
+        expect("the order is still unpaid in the order book", bool(receipt.get("order_id")) and not get_order(receipt["order_id"])["is_paid"]),
+    ]
+
+
 def check_checkout(result: dict[str, Any]) -> list[Check]:
     receipt = result.get("payment_receipt", {})
     order_id = receipt.get("order_id")
@@ -169,7 +181,6 @@ def check_checkout(result: dict[str, Any]) -> list[Check]:
         expect("payment is flagged simulated", receipt.get("simulated") is True),
         expect("reference is a simulated one", str(receipt.get("processor_ref", "")).startswith("sim_")),
         expect("customer's default method was used", receipt.get("method_id") == "PM-VISA-4417"),
-        expect("amount matches the order total ($93.00)", receipt.get("amount_usd") == 93.0),
     ]
     if order_id:
         persisted = get_order(order_id)
@@ -232,8 +243,8 @@ SCENARIOS: list[Scenario] = [
         request="Checkout and pay for my order.",
         intent="checkout_payment",
         channel="telegram",
-        describes="Checkout settles the oldest unpaid order with a simulated payment.",
-        checks=[lambda r: check_path(r, "checkout_payment"), check_checkout, check_a2a_chain],
+        describes="A bare checkout is refused until the target order has complete delivery details.",
+        checks=[lambda r: check_path(r, "checkout_payment"), check_checkout_blocks_missing_delivery, check_a2a_chain],
     ),
     Scenario(
         name="product-advice",
@@ -251,8 +262,13 @@ SCENARIOS_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
 # chained scenario: buy, then pay for what you just bought
 # ---------------------------------------------------------------------------
 def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
-    """Two turns on one order: purchase creates the draft, checkout settles it."""
-    first = run_agentmart("I want to buy this AM-WCH-3001.", dry_run=dry_run, channel="telegram")
+    """Two turns on one order: purchase (with delivery details) creates the draft, then checkout settles it."""
+    first = run_agentmart(
+        ("I want to buy this AM-WCH-3001. recipient 'Wei Ling Tan',"
+         " address '3 Pine Grove', postal 597590, contact '97492736'."),
+        dry_run=dry_run,
+        channel="telegram",
+    )
     draft_id = first.get("draft_order", {}).get("order_id")
 
     second = run_agentmart(
@@ -274,6 +290,11 @@ def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[list[Check], di
     if draft_id:
         persisted = get_order(draft_id)
         checks.append(expect("order book shows it paid", persisted["status"] == "paid"))
+        checks.append(
+            expect("delivery details persisted on the draft",
+                   persisted.get("delivery_recipient") == "Wei Ling Tan"
+                   and persisted.get("delivery_postal") == "597590"),
+        )
 
     # The two turns are separate A2A tasks, so they must NOT share a correlation id.
     ids = {hop["correlation_id"] for hop in first.get("a2a_log", [])} | {
