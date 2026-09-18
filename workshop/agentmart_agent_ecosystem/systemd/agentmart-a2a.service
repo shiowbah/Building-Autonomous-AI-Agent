@@ -1,0 +1,20 @@
+[Unit]
+Description=AgentMart A2A Server - LangGraph agent ecosystem over A2A (port 9901)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/Building-Autonomous-AI-Agent/workshop/agentmart_agent_ecosystem/.venv/bin/python a2a_server.py --log-level INFO
+WorkingDirectory=%h/Building-Autonomous-AI-Agent/workshop/agentmart_agent_ecosystem
+Environment="PATH=%h/.hermes/hermes-agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=%h"
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
