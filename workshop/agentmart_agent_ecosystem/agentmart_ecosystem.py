@@ -290,14 +290,17 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         # 0. An explicit request to *draft* an order outranks every payment word
         # that may trail it ("...just confirm the draft and the next checkout step").
-        # The middle is deliberately loose: remote agents say "create a payable
-        # checkout draft", "create an order draft", "read/write order draft only".
-        # A bare *creation* request ("create a payable order") is the same capability
+        # The verb list and middle are deliberately loose: remote agents say "create
+        # a payable checkout draft", "prepare a checkout draft", "make an order
+        # draft", "read/write order draft only". The word "checkout" alone must NOT
+        # win here — "prepare a checkout draft" is drafting, not settling. A bare
+        # *creation* request ("create a payable order") is the same capability
         # invite and must also land on the drafting path, never the charging one.
         "purchase_intent",
         re.compile(
-            r"create\s+(?:a\s+)?(?:new\s+)?(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
-            r"create\b[^.]{0,80}\bdraft\b|"
+            r"(?:create|prepare|make|write|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
+            r"(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
+            r"(?:create|prepare|make|write|set\s*up)\b[^.]{0,80}\bdraft\b|"
             r"(?:draft|checkout)\s+order\b",
             re.IGNORECASE,
         ),

@@ -325,6 +325,10 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
      "take any payment, authorization, capture, refund, or cancellation action.", "order_status"),
     # No keyword survives the strip -- the order id alone must keep it off product_advice.
     ("Please proceed to fulfillment for existing order AM-ORD-20260915-0003.", "order_status"),
+    # "prepare a checkout draft" is drafting, never settling -- checkout must not win.
+    ("The user wants to buy AM-EAR-1002 (Nimbus Air 2). Record the purchase intent "
+     "and prepare a checkout draft for quantity 1. Do not charge, capture, or call "
+     "the payment agent.", "purchase_intent"),
     # "where to buy" is advice; "wants to buy" is intent.
     ("Find wireless earbuds under $120 and include a link or where to buy.", "product_advice"),
     ("The customer wants to buy SKU AM-EAR-1002 (Nimbus Air 2).", "purchase_intent"),
