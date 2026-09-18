@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import operator
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,7 @@ from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
 from catalog import CatalogNotSeededError, format_product_listing, query_products
+from logging_config import bind_agent, setup_logging
 from orders import (
     OrderBookNotSeededError,
     OrderNotFoundError,
@@ -27,6 +30,12 @@ from orders import (
     get_order,
     list_orders,
 )
+
+# A2A server requests the graph in its own process. Setting up logging at import
+# time means every entry point (CLI + a2a_server + test_scenarios) writes to the
+# same rotating logs/agentmart.log file from the same configuration.
+setup_logging()
+log = logging.getLogger("agentmart")
 
 
 AgentName = Literal[
@@ -112,6 +121,11 @@ A2A_LIFECYCLE = ("proposed", "accepted", "in_progress", "completed", "failed")
 
 DEFAULT_MODEL = "moonshotai/kimi-k3"
 
+# Cumulative token usage across every model interaction, keyed by agent name.
+# complete() feeds it; run_agentmart snapshots a baseline before invoking and
+# diffs afterwards, so parallel A2A requests never corrupt a run's totals.
+RUN_USAGE: dict[str, dict[str, int]] = {}
+
 
 class OpenRouterHermesClient:
     """OpenAI-compatible client for OpenRouter, configured for Hermes/MyShopper.
@@ -147,8 +161,21 @@ class OpenRouterHermesClient:
         self.http_referer = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
         self.app_title = os.getenv("OPENROUTER_APP_TITLE", "AgentMart Workshop")
 
+        # Per-interaction usage and elapsed time, captured from the API response
+        # for every model call. `last_usage`/`last_elapsed` describe the most
+        # recent interaction; `usage_totals` accumulates across this client's
+        # lifetime so a run can report what the whole chain cost.
+        self.last_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.last_elapsed: float = 0.0
+        self.usage_totals: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0,
+        }
+
     def complete(self, agent_name: str, system_prompt: str, user_prompt: str) -> str:
+        started = time.monotonic()
         if self.dry_run or not self.api_key:
+            self.last_elapsed = time.monotonic() - started
+            self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             return self._dry_run_reply(agent_name, user_prompt)
 
         from openai import OpenAI
@@ -183,7 +210,43 @@ class OpenRouterHermesClient:
             )
 
         response = client.chat.completions.create(**kwargs)
+        self.last_elapsed = time.monotonic() - started
+
+        # Token usage comes back under `usage` on OpenAI-compatible responses and
+        # under `usage` from OpenRouter too; guard the shape defensively so an
+        # unexpected provider cannot crash the graph.
+        usage = getattr(response, "usage", None)
+        self.last_usage = {
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        } if usage is not None else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        for key, value in self.last_usage.items():
+            self.usage_totals[key] += value
+        self.usage_totals["calls"] += 1
+        agent_totals = RUN_USAGE.setdefault(
+            agent_name, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        )
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            agent_totals[key] += self.last_usage[key]
+        agent_totals["calls"] += 1
+        log.debug(
+            "%s: tokens prompt=%s completion=%s total=%s elapsed=%.2fs",
+            agent_name,
+            self.last_usage["prompt_tokens"],
+            self.last_usage["completion_tokens"],
+            self.last_usage["total_tokens"],
+            self.last_elapsed,
+        )
         return response.choices[0].message.content or ""
+
+    def usage_line(self) -> str:
+        """One-line summary of the most recent interaction, for log evidence."""
+        return (
+            f"tokens={self.last_usage['total_tokens']} "
+            f"(prompt {self.last_usage['prompt_tokens']} + completion {self.last_usage['completion_tokens']}) "
+            f"elapsed={self.last_elapsed:.2f}s"
+        )
 
     @staticmethod
     def _dry_run_reply(agent_name: str, user_prompt: str) -> str:
@@ -217,8 +280,17 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         # 0. An explicit request to *draft* an order outranks every payment word
         # that may trail it ("...just confirm the draft and the next checkout step").
+        # The middle is deliberately loose: remote agents say "create a payable
+        # checkout draft", "create an order draft", "read/write order draft only".
+        # A bare *creation* request ("create a payable order") is the same capability
+        # invite and must also land on the drafting path, never the charging one.
         "purchase_intent",
-        re.compile(r"draft\s+order|create\s+(?:a\s+)?draft", re.IGNORECASE),
+        re.compile(
+            r"create\s+(?:a\s+)?(?:new\s+)?(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
+            r"create\b[^.]{0,80}\bdraft\b|"
+            r"(?:draft|checkout)\s+order\b",
+            re.IGNORECASE,
+        ),
     ),
     (
         # 1. Unambiguous checkout imperatives.
@@ -351,6 +423,14 @@ def emit_envelope(
         state=lifecycle,
         protocol=task.get("protocol", "agentmart.a2a.v1"),
     ).to_dict()
+    log.debug(
+        "a2a hop %s -> %s intent=%s lifecycle=%s correlation=%s",
+        sender,
+        recipient,
+        intent,
+        lifecycle,
+        envelope["correlation_id"],
+    )
     return envelope
 
 
@@ -396,7 +476,25 @@ def make_agent_node(
             dry_run=state.get("dry_run", False),
             model_config=model_config_from_state(state),
         )
+        agent_log = bind_agent(agent)
+        started = time.monotonic()
+        log.info(
+            "%s: starting (intent=%s, dry_run=%s, model=%s)",
+            agent,
+            state.get("intent"),
+            state.get("dry_run", False),
+            client.model,
+        )
         result = client.complete(agent, system_prompt, prompt_builder(state))
+        elapsed = time.monotonic() - started
+        log.info(
+            "%s: completed in %.2fs (%d chars) | %s",
+            agent,
+            elapsed,
+            len(result),
+            client.usage_line(),
+        )
+        agent_log.debug("reply: %s", result)
         done = emit_envelope(
             state,
             sender=agent,
@@ -453,6 +551,15 @@ def hermes_myshopper_node(state: AgentMartState) -> AgentMartState:
         dry_run=state.get("dry_run", False),
         model_config=hermes_config.get("model", {}),
     )
+    started = time.monotonic()
+    log.info(
+        "hermes_myshopper: routing '%.100s' -> intent=%s customer=%s task=%s model=%s",
+        customer_request,
+        intent,
+        customer_id,
+        task_id,
+        client.model,
+    )
     message = client.complete(
         "hermes_myshopper",
         (
@@ -461,6 +568,11 @@ def hermes_myshopper_node(state: AgentMartState) -> AgentMartState:
             "Create a short handoff note for the AgentMart agent ecosystem."
         ),
         json.dumps(envelope, indent=2),
+    )
+    log.info(
+        "hermes_myshopper: handoff written in %.2fs | %s",
+        time.monotonic() - started,
+        client.usage_line(),
     )
 
     next_state: AgentMartState = {
@@ -661,6 +773,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
         sku = state.get("target_sku")
         if not sku:
             next_state["draft_order"] = {"error": "no SKU identified in the customer request"}
+            log.warning("order_agent: purchase_intent with no target_sku (customer=%s)", customer_id)
         else:
             try:
                 draft = create_draft_order(
@@ -673,8 +786,10 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                 next_state["draft_order"] = draft
                 next_state["target_order_id"] = draft["order_id"]
                 next_state["order_context"] = format_order(draft)
+                log.info("order_agent: drafted %s for sku=%s customer=%s", draft["order_id"], sku, customer_id)
             except (CatalogNotSeededError, OrderBookNotSeededError, ValueError) as exc:
                 next_state["draft_order"] = {"error": f"{type(exc).__name__}: {exc}"}
+                log.error("order_agent: draft failed for sku=%s: %s", sku, exc)
 
     # A bare "checkout and pay" resolves to the customer's oldest unpaid order.
     if intent == "checkout_payment" and not next_state.get("target_order_id"):
@@ -690,7 +805,16 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
         dry_run=state.get("dry_run", False),
         model_config=model_config_from_state(state),
     )
+    started = time.monotonic()
+    log.info("order_agent: starting (intent=%s, order=%s, model=%s)", intent, next_state.get("target_order_id"), client.model)
     result = client.complete("order_agent", ORDER_AGENT_SYSTEM_PROMPT, _order_agent_prompt(next_state))
+    log.info(
+        "order_agent: completed in %.2fs (%d chars) | %s",
+        time.monotonic() - started,
+        len(result),
+        client.usage_line(),
+    )
+    bind_agent("order_agent").debug("reply: %s", result)
 
     done = emit_envelope(
         next_state,
@@ -740,6 +864,7 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
     receipt: dict[str, Any]
     if not order_id:
         receipt = {"error": "no payable order found for this customer"}
+        log.warning("payment_agent: checkout_payment with no target_order_id")
     else:
         try:
             settled = checkout_and_pay(order_id)
@@ -753,8 +878,15 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
                 "order_id": order_id,
                 "order_status": settled["order"]["status"],
             }
+            log.info(
+                "payment_agent: SIMULATED capture ok order=%s payment=%s amount_usd=%s",
+                order_id,
+                receipt["payment_id"],
+                receipt["amount_usd"],
+            )
         except (OrderNotFoundError, OrderBookNotSeededError, ValueError) as exc:
             receipt = {"error": f"{type(exc).__name__}: {exc}", "order_id": order_id}
+            log.error("payment_agent: capture failed for %s: %s", order_id, exc)
 
     next_state["payment_receipt"] = receipt
 
@@ -762,11 +894,20 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
         dry_run=state.get("dry_run", False),
         model_config=model_config_from_state(state),
     )
+    started = time.monotonic()
+    log.info("payment_agent: explaining receipt (order=%s, simulated=True)", order_id)
     result = client.complete(
         "payment_agent",
         PAYMENT_AGENT_SYSTEM_PROMPT,
         json.dumps({"a2a_task": state["a2a_task"], "receipt": receipt}, indent=2),
     )
+    log.info(
+        "payment_agent: completed in %.2fs (%d chars) | %s",
+        time.monotonic() - started,
+        len(result),
+        client.usage_line(),
+    )
+    bind_agent("payment_agent").debug("reply: %s", result)
 
     done = emit_envelope(
         next_state,
@@ -829,7 +970,9 @@ def _stages(intent: str) -> list[str | list[str]]:
 
 def route_from_hermes(state: AgentMartState) -> str | list[str]:
     """First AgentMart stage for this intent. A list fans out in one superstep."""
-    return _stages(state.get("intent", "product_advice"))[0]
+    stage = _stages(state.get("intent", "product_advice"))[0]
+    _debug_stage("hermes_myshopper", state.get("intent", "product_advice"), stage, "first")
+    return stage
 
 
 def _next_after(node: str) -> Callable[[AgentMartState], str | list[str]]:
@@ -844,10 +987,19 @@ def _next_after(node: str) -> Callable[[AgentMartState], str | list[str]]:
         for index, stage in enumerate(stages):
             members = stage if isinstance(stage, list) else [stage]
             if node in members:
-                return stages[index + 1] if index + 1 < len(stages) else END
+                nxt = stages[index + 1] if index + 1 < len(stages) else END
+                _debug_stage(node, state.get("intent", "product_advice"), nxt, "next")
+                return nxt
+        _debug_stage(node, state.get("intent", "product_advice"), END, "end")
         return END
 
     return router
+
+
+def _debug_stage(src: str, intent: str, dest: str | list[str], stage_kind: str) -> None:
+    """One-line graph-traversal evidence: which node handed control to which stage."""
+    target = ",".join(dest) if isinstance(dest, list) else dest
+    log.debug("graph: %s -> %s [%s stage, intent=%s]", src, target, stage_kind, intent)
 
 
 def build_graph():
@@ -920,7 +1072,10 @@ def run_agentmart(
     intent: Intent | None = None,
 ) -> AgentMartState:
     app = build_graph()
-    return normalize_ordering(app.invoke(
+    log.info("run_agentmart: invoke request=%r channel=%s customer=%s", customer_request, channel, customer_id)
+    usage_baseline = dict(RUN_USAGE)
+    started = time.monotonic()
+    result = normalize_ordering(app.invoke(
         {
             "customer_request": customer_request,
             "channel": channel,
@@ -933,6 +1088,44 @@ def run_agentmart(
             "a2a_log": [],
         }
     ))
+    elapsed = time.monotonic() - started
+    log.info(
+        "run_agentmart: done in %.2fs intent=%s agents_woken=%s dry_run=%s",
+        elapsed,
+        result.get("intent"),
+        ",".join(e.get("agent", "?") for e in result.get("transcript", [])),
+        dry_run,
+    )
+    _log_usage_summary(usage_baseline)
+    return result
+
+
+def _usage_delta(baseline: dict[str, dict[str, int]], agent: str) -> dict[str, int]:
+    before = baseline.get(agent, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    after = RUN_USAGE.get(agent, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    return {key: after.get(key, 0) - before.get(key, 0) for key in before}
+
+
+def _log_usage_summary(baseline: dict[str, dict[str, int]]) -> None:
+    """Per-agent token + latency accounting for the run that just finished."""
+    rows = [
+        (agent, _usage_delta(baseline, agent))
+        for agent in sorted(RUN_USAGE)
+    ]
+    for agent, usage in rows:
+        if usage["calls"] > 0:
+            log.info(
+                "usage %s: calls=%d tokens=%d (prompt %d + completion %d)",
+                agent,
+                usage["calls"],
+                usage["total_tokens"],
+                usage["prompt_tokens"],
+                usage["completion_tokens"],
+            )
+    total_tokens = sum(u["total_tokens"] for _, u in rows if u["calls"] > 0)
+    total_calls = sum(u["calls"] for _, u in rows if u["calls"] > 0)
+    if total_calls > 0:
+        log.info("usage run: total tokens=%d across %d interactions", total_tokens, total_calls)
 
 
 def check_model_connection(config_path: str | None = None) -> int:

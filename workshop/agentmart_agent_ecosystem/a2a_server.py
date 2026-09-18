@@ -38,6 +38,7 @@ from agentmart_ecosystem import (
     load_hermes_a2a_config,
     run_agentmart,
 )
+from logging_config import setup_logging
 
 logger = logging.getLogger("agentmart.a2a")
 
@@ -319,12 +320,17 @@ def main() -> None:
     parser.add_argument("--no-hops", action="store_true",
                         help="Return only the final answer, without the A2A hop trail.")
     parser.add_argument("--verbose", action="store_true", help="Debug logging.")
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("AGENTMART_LOG_LEVEL", "INFO"),
+        help="Console log level for the agentmart logger (DEBUG/INFO/WARNING). "
+             "The rotating file always records DEBUG. (default: INFO)",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Debug level for the console only when requested; file always gets everything.
+    console_level = "DEBUG" if args.verbose else str(args.log_level).upper()
+    setup_logging(console_level)
 
     OPTIONS.update(
         dry_run=args.dry_run,
