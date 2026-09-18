@@ -810,7 +810,6 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                     items=[{"sku": sku, "quantity": 1}],
                     warehouse="SG-CENTRAL",
                     fulfillment_method="standard_delivery",
-                    shipping_usd=3.5,
                 )
                 next_state["draft_order"] = draft
                 next_state["target_order_id"] = draft["order_id"]

@@ -13,7 +13,7 @@ is ever contacted, no card number is stored, and no money moves.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -64,6 +64,10 @@ def _connect(db_path=None) -> sqlite3.Connection:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _eta_string(days: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).date().isoformat()
 
 
 # --------------------------------------------------------------------------
@@ -175,12 +179,31 @@ def create_draft_order(
     eta_date: str | None = None,
     db_path=None,
 ) -> dict[str, Any]:
-    """Create an `awaiting_payment` order from [{sku, quantity}] using catalog prices."""
+    """Create an `awaiting_payment` order from [{sku, quantity}] using catalog prices.
+
+    When a warehouse + fulfillment method is given, the real shipping cost and
+    ETA are taken from the seeded ``fulfillment_options`` table so the draft
+    always matches the catalog quote; ``shipping_usd`` is only a fallback if no
+    matching option exists.
+    """
     if not items:
         raise ValueError("create_draft_order requires at least one item")
 
     conn = _connect(db_path)
     try:
+        shipping = round(float(shipping_usd), 2)
+        eta = eta_date
+        if warehouse and fulfillment_method:
+            option = conn.execute(
+                "SELECT cost_usd, eta_days FROM fulfillment_options"
+                " WHERE warehouse = ? AND method = ?",
+                (warehouse, fulfillment_method),
+            ).fetchone()
+            if option:
+                shipping = round(float(option["cost_usd"]), 2)
+                if eta is None:
+                    eta = _eta_string(int(option["eta_days"]))
+
         priced: list[dict[str, Any]] = []
         for item in items:
             sku = item["sku"]
@@ -207,10 +230,10 @@ def create_draft_order(
             "warehouse": warehouse,
             "fulfillment_method": fulfillment_method,
             "tracking_ref": None,
-            "eta_date": eta_date,
+            "eta_date": eta,
             "subtotal_usd": subtotal,
-            "shipping_usd": round(float(shipping_usd), 2),
-            "total_usd": round(subtotal + float(shipping_usd), 2),
+            "shipping_usd": shipping,
+            "total_usd": round(subtotal + shipping, 2),
         }
 
         with conn:

@@ -150,7 +150,7 @@ def check_draft_order(result: dict[str, Any]) -> list[Check]:
         expect("a draft order was created", bool(order_id)),
         expect("draft is awaiting_payment, not paid", draft.get("status") == "awaiting_payment"),
         expect("line item is the requested SKU", [i["sku"] for i in draft.get("items", [])] == ["AM-EAR-1002"]),
-        expect("priced from the catalog ($89.00 + $3.50 shipping)", draft.get("total_usd") == 92.5),
+        expect("priced from the catalog ($89.00, standard delivery is free)", draft.get("total_usd") == 89.0),
         expect("nothing was charged", draft.get("amount_paid_usd", 0) == 0),
         expect("Payment Agent did NOT run", "payment_agent" not in agents_visited(result)),
     ]
@@ -267,8 +267,8 @@ def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[str, list[Check
         expect("turn 2 captured the payment", receipt.get("status") == "captured"),
         expect("payment flagged simulated", receipt.get("simulated") is True),
         expect(
-            "total is the catalog price plus shipping ($149.00 + $3.50)",
-            receipt.get("amount_usd") == 152.5,
+            "total is the catalog price, standard delivery is free ($149.00)",
+            receipt.get("amount_usd") == 149.0,
         ),
     ]
     if draft_id:
