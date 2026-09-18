@@ -138,6 +138,16 @@ class OpenRouterHermesClient:
 
     def __init__(self, dry_run: bool = False, model_config: dict[str, Any] | None = None) -> None:
         load_dotenv()
+        # The API key is deliberately NOT duplicated into the lab .env. It lives
+        # only in Hermes' own env file (~/.hermes/.env), which the gateway already
+        # loads; pull it in here so the workshop clients and A2A server resolve the
+        # same single key instead of carrying a second plaintext copy. Values that
+        # the lab DOES set (base_url, model, limits) are never clobbered: both
+        # loads use override=False, so the first value already in the environment wins.
+        if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")):
+            hermes_dotenv = os.path.expanduser("~/.hermes/.env")
+            if os.path.isfile(hermes_dotenv):
+                load_dotenv(hermes_dotenv, override=False)
         config = model_config or {}
         self.dry_run = dry_run
         # OPENAI_* wins when set, so pointing the lab at OpenAI directly needs no rename.
