@@ -23,6 +23,7 @@ from orders import (
     OrderNotFoundError,
     checkout_and_pay,
     create_draft_order,
+    find_open_draft,
     find_payable_order,
     format_order,
     format_orders,
@@ -292,24 +293,26 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # that may trail it ("...just confirm the draft and the next checkout step").
         # The verb list and middle are deliberately loose: remote agents say "create
         # a payable checkout draft", "prepare a checkout draft", "make an order
-        # draft", "read/write order draft only". The word "checkout" alone must NOT
-        # win here — "prepare a checkout draft" is drafting, not settling. A bare
-        # *creation* request ("create a payable order") is the same capability
-        # invite and must also land on the drafting path, never the charging one.
+        # draft", "read/write order draft only", "update/refresh the checkout draft".
+        # The word "checkout" alone must NOT win here — "prepare a checkout draft"
+        # is drafting, not settling. A bare *creation* request ("create a payable
+        # order") is the same capability invite and must also land on the drafting
+        # path, never the charging one.
         "purchase_intent",
         re.compile(
             r"(?:create|prepare|make|write|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
             r"(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
-            r"(?:create|prepare|make|write|set\s*up)\b[^.]{0,80}\bdraft\b|"
+            r"(?:create|prepare|make|write|set\s*up|update|refresh)\b[^.]{0,80}\bdraft\b|"
             r"(?:draft|checkout)\s+order\b",
             re.IGNORECASE,
         ),
     ),
     (
-        # 1. Unambiguous checkout imperatives.
+        # 1. Unambiguous checkout imperatives. "checkout draft" is a noun phrase,
+        # never a settle-and-pay instruction.
         "checkout_payment",
         re.compile(
-            r"check\s?out\b(?!\s*(?:step|steps|process|flow|page|link|option|details))|"
+            r"check\s?out\b(?!\s*(?:step|steps|process|flow|page|link|option|details|draft))|"
             r"\bpay\s+now\b|place\s+the\s+order|settle\s+(up|the\s+bill)",
             re.IGNORECASE,
         ),
@@ -801,16 +804,45 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     if intent == "purchase_intent":
         sku = state.get("target_sku")
         if not sku:
-            next_state["draft_order"] = {"error": "no SKU identified in the customer request"}
-            log.warning("order_agent: purchase_intent with no target_sku (customer=%s)", customer_id)
+            open_drafts = sorted(
+                (
+                    order for order in list_orders(customer_id=customer_id)
+                    if order["status"] in ("draft", "awaiting_payment") and not order["is_paid"]
+                ),
+                key=lambda o: o["placed_at"],
+                reverse=True,
+            )
+            if open_drafts:
+                draft = open_drafts[0]
+                next_state["draft_order"] = draft
+                next_state["target_order_id"] = draft["order_id"]
+                next_state["order_context"] = format_order(draft)
+                log.info(
+                    "order_agent: refreshed newest open draft %s (no sku named, customer=%s)",
+                    draft["order_id"], customer_id,
+                )
+            else:
+                next_state["draft_order"] = {"error": "no SKU identified and no open draft to update"}
+                log.warning(
+                    "order_agent: purchase_intent with no target_sku and no open draft (customer=%s)",
+                    customer_id,
+                )
         else:
             try:
-                draft = create_draft_order(
-                    customer_id=customer_id,
-                    items=[{"sku": sku, "quantity": 1}],
-                    warehouse="SG-CENTRAL",
-                    fulfillment_method="standard_delivery",
-                )
+                existing = find_open_draft(customer_id, sku)
+                if existing:
+                    draft = existing
+                    log.info(
+                        "order_agent: refreshed draft %s for sku=%s customer=%s",
+                        draft["order_id"], sku, customer_id,
+                    )
+                else:
+                    draft = create_draft_order(
+                        customer_id=customer_id,
+                        items=[{"sku": sku, "quantity": 1}],
+                        warehouse="SG-CENTRAL",
+                        fulfillment_method="standard_delivery",
+                    )
                 next_state["draft_order"] = draft
                 next_state["target_order_id"] = draft["order_id"]
                 next_state["order_context"] = format_order(draft)

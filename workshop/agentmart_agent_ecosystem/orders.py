@@ -167,6 +167,20 @@ def find_payable_order(customer_id: str, db_path=None) -> dict[str, Any] | None:
     return sorted(candidates, key=lambda o: o["placed_at"])[0] if candidates else None
 
 
+def find_open_draft(customer_id: str, sku: str, db_path=None) -> dict[str, Any] | None:
+    """The customer's newest unpaid draft that already contains ``sku``.
+
+    Lets a "prepare / refresh the checkout draft" turn update the same draft
+    instead of minting a second order every time the peer re-quotes.
+    """
+    for order in list_orders(customer_id=customer_id, db_path=db_path):
+        items = order.get("items", [])
+        if order["status"] in ("draft", "awaiting_payment") and not order["is_paid"]:
+            if any(item.get("sku") == sku for item in items):
+                return order
+    return None
+
+
 # --------------------------------------------------------------------------
 # writes
 # --------------------------------------------------------------------------

@@ -250,7 +250,7 @@ SCENARIOS_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
 # ---------------------------------------------------------------------------
 # chained scenario: buy, then pay for what you just bought
 # ---------------------------------------------------------------------------
-def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[str, list[Check], dict[str, Any]]:
+def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
     """Two turns on one order: purchase creates the draft, checkout settles it."""
     first = run_agentmart("I want to buy this AM-WCH-3001.", dry_run=dry_run, channel="telegram")
     draft_id = first.get("draft_order", {}).get("order_id")
@@ -281,7 +281,37 @@ def run_buy_then_checkout(dry_run: bool, verbose: bool) -> tuple[str, list[Check
     }
     checks.append(expect("each turn is its own A2A task (2 correlation ids)", len(ids) == 2))
 
-    return "buy-then-checkout", checks, second
+    return checks, second
+
+
+def run_draft_refresh(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """Re-quoting a draft reused the same open draft and never charges."""
+    first = run_agentmart("I want to buy this AM-EAR-1002.", dry_run=dry_run, channel="telegram")
+    draft_id = first.get("draft_order", {}).get("order_id")
+
+    second = run_agentmart(
+        ("Update the checkout draft with the user-provided delivery details: address line "
+         "'3 Pine Grove', recipient 'Ang Chin Tiong', contact number '97492736', postal code "
+         "597590, Singapore. Keep quantity 1 and standard delivery as the current method unless "
+         "unavailable. Do not place the order, reserve stock, authorize payment, or capture "
+         "funds. Return the updated total and any remaining required confirmation."),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 1 left it unpaid", first.get("draft_order", {}).get("status") == "awaiting_payment"),
+        expect("turn 2 routed to drafting, not checkout_payment", second.get("intent") == "purchase_intent"),
+        expect("turn 2 reused the same draft id", second.get("draft_order", {}).get("order_id") == draft_id),
+        expect("turn 2 did NOT run the payment agent", "payment_agent" not in agents_visited(second)),
+        expect("no payment receipt was produced", not second.get("payment_receipt")),
+    ]
+    if draft_id:
+        persisted = get_order(draft_id)
+        checks.append(expect("the draft is still awaiting_payment", persisted["status"] == "awaiting_payment"))
+
+    return checks, second
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +359,16 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
     ("The user wants to buy AM-EAR-1002 (Nimbus Air 2). Record the purchase intent "
      "and prepare a checkout draft for quantity 1. Do not charge, capture, or call "
      "the payment agent.", "purchase_intent"),
+    # Updating/refreshing a checkout draft is drafting, never settling -- even though
+    # it literally says "checkout draft", the payment path must not fire.
+    ("Update the checkout draft with the user-provided delivery details: address "
+     "line '3 Pine Grove', recipient 'Ang Chin Tiong', contact number '97492736', "
+     "postal code 597590, Singapore. Keep quantity 1 and standard delivery as the "
+     "current method unless unavailable. Do not place the order, reserve stock, "
+     "authorize payment, or capture funds. Return the updated total and any "
+     "remaining required confirmation.", "purchase_intent"),
+    ("Refresh the checkout draft for AM-EAR-1002 with quantity 1 and standard "
+     "delivery. Do not charge or authorize payment.", "purchase_intent"),
     # "where to buy" is advice; "wants to buy" is intent.
     ("Find wireless earbuds under $120 and include a link or where to buy.", "product_advice"),
     ("The customer wants to buy SKU AM-EAR-1002 (Nimbus Air 2).", "purchase_intent"),
@@ -387,21 +427,27 @@ def main() -> int:
         for scenario in SCENARIOS:
             print(f"{scenario.name:<24} {scenario.intent:<17} {scenario.request}")
         print(f"{'buy-then-checkout':<24} {'(chained)':<17} purchase a SKU, then settle that order")
-        print(f"{'intent-routing':<24} {'(routing)':<17} 14 phrasings, human and agent-generated")
+        print(f"{'draft-refresh':<24} {'(chained)':<17} re-quote a draft: reused, never charged")
+        print(f"{'intent-routing':<24} {'(routing)':<17} phrasings, human and agent-generated")
         return 0
 
     dry_run = not args.live
     selected = SCENARIOS
-    run_chained = True
+    run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        unknown = names - set(SCENARIOS_BY_NAME) - {"buy-then-checkout", "intent-routing"}
+        known_chained = {"buy-then-checkout", "draft-refresh"}
+        unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
-            print(f"Available: {', '.join(SCENARIOS_BY_NAME)}, buy-then-checkout, intent-routing", file=sys.stderr)
+            print(
+                f"Available: {', '.join(SCENARIOS_BY_NAME)}, "
+                f"{', '.join(known_chained)}, intent-routing",
+                file=sys.stderr,
+            )
             return 2
         selected = [s for s in SCENARIOS if s.name in names]
-        run_chained = "buy-then-checkout" in names
+        run_chained = names & known_chained
 
     mode = "LIVE (OpenRouter)" if args.live else "dry-run (no model calls)"
     print(f"AgentMart scenario suite — {mode}")
@@ -427,23 +473,38 @@ def main() -> int:
             checks = [expect(f"scenario raised {type(exc).__name__}: {exc}", False)]
         results.append(report(scenario.name, scenario.request, scenario.describes, checks))
 
-    if run_chained:
-        if not args.no_reseed:
-            seed()
-        try:
-            name, checks, result = run_buy_then_checkout(dry_run, args.verbose)
-            if args.verbose:
-                print_detail(result)
-        except Exception as exc:  # noqa: BLE001
-            name, checks = "buy-then-checkout", [expect(f"scenario raised {type(exc).__name__}: {exc}", False)]
-        results.append(
-            report(
-                name,
-                "I want to buy this AM-WCH-3001. -> Checkout and pay for order <id>.",
-                "Two turns on one order id: draft then settle.",
-                checks,
-            )
-        )
+    chained = [
+        (
+            "buy-then-checkout",
+            run_buy_then_checkout,
+            "I want to buy this AM-WCH-3001. -> Checkout and pay for order <id>.",
+            "Two turns on one order id: draft then settle.",
+        ),
+        (
+            "draft-refresh",
+            run_draft_refresh,
+            "Buy AM-EAR-1002 -> update the checkout draft with delivery details.",
+            "Re-quoting a draft reuses the draft and never charges.",
+        ),
+    ]
+    for name, fn, request, describes in chained:
+        if not args.scenario or name in run_chained:
+            if not args.no_reseed:
+                seed()
+            try:
+                chained_checks, result = fn(dry_run, args.verbose)
+                if args.verbose:
+                    print_detail(result)
+                results.append(report(name, request, describes, chained_checks))
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    report(
+                        name,
+                        request,
+                        describes,
+                        [expect(f"scenario raised {type(exc).__name__}: {exc}", False)],
+                    )
+                )
 
     if not args.no_reseed:
         seed()  # leave the lab in its seeded state
