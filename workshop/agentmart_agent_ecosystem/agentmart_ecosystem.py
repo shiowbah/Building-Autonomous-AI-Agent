@@ -296,7 +296,23 @@ ORDER_ID_PATTERN = re.compile(r"\bAM-ORD-[\w-]+\b", re.IGNORECASE)
 # ("has my payment gone through?") must stay a status lookup and never charge.
 INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
-        # 0. Read-only/verification phrasings never settle anything. Remote peers
+        # 0. An imperative to *put values on an order* is an update even when it
+        # quotes an earlier read-only result ("The read-only lookup shows ... are
+        # still not stored. Please update ... with exactly: ..."). The update verb
+        # plus a concrete "with ..." values clause must outrank the read-only marker,
+        # or the correction gets downgraded to a no-op lookup. A literal status
+        # question ("has anything changed with my order?") carries no such clause.
+        "purchase_intent",
+        re.compile(
+            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,100}\bwith\s+"
+            r"(?:exactly|these|those|the\s+following)\b|"
+            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,80}\bdelivery\s+"
+            r"(?:details|address)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # 1. Read-only/verification phrasings never settle anything. Remote peers
         # state their own guardrails inline ("Read-only verification only"), so the
         # markers here mean "lookup", not "charge". A real checkout that happens to
         # verify the cart first is NOT matched (no read-only marker in it), so it
@@ -311,12 +327,13 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"\breconcil(?:iation|ing)?\b|"
             r"\baudit\b|"
             r"confirm\s+(?:whether|if)\s+no\b|"
-            r"\bverif\w*\b.{0,220}\b(?:read\s*back|by\s+looking\s+it\s+up|current\s+status|order\s+status)\b",
+            r"\bverif\w*\b.{0,220}\b(?:read\s*back|by\s+looking\s+it\s+up|current\s+status|order\s+status)\b|"
+            r"\b(?:read\s*back|look\s+it\s+up|lookup)\b.{0,220}\b(?:stored|status|order\b|draft\b)",
             re.IGNORECASE,
         ),
     ),
     (
-        # 1. An explicit request to *draft* an order outranks every payment word
+        # 2. An explicit request to *draft* an order outranks every payment word
         # that may trail it ("...just confirm the draft and the next checkout step").
         # The verb list and middle are deliberately loose: remote agents say "create
         # a payable checkout draft", "prepare a checkout draft", "make an order
@@ -325,14 +342,17 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # is drafting, not settling. A bare *creation* request ("create a payable
         # order") is the same capability invite and must also land on the drafting
         # path, never the charging one.
-        "purchase_intent",
+"purchase_intent",
         re.compile(
             r"(?:create|prepare|make|write|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
             r"(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
-r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b|"
-        r"(?:draft|checkout)\s+order\b",
-        re.IGNORECASE,
-    ),
+            r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b|"
+            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,100}"
+            r"\b(?:with\s+(?:exactly|these|those|the\s+following|the\s+new|delivery)|"
+            r"delivery\s+(?:details|address)|recipient|postal|contact\s+number)\b|"
+            r"(?:draft|checkout)\s+order\b",
+            re.IGNORECASE,
+        ),
     ),
     (
         # 2. Unambiguous checkout imperatives. "checkout draft" is a noun phrase,
@@ -385,7 +405,7 @@ r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|
 # capability they are forbidding, so matching them verbatim routes a prohibition to
 # the Payment Agent. Drop each one up to its clause boundary before any rule runs.
 PROHIBITION_CLAUSE = re.compile(
-    r"\b(?:do\s+not|do\s?n['\u2019]t|does\s+not|never|without|avoid|no\s+need\s+to)\b[^.;:\n]*",
+    r"\b(?:do\s+not|do\s?n['\u2019]t|does\s+not|never|without|avoid|no\s+need\s+to)\b[^.;:()\n]*",
     re.IGNORECASE,
 )
 
@@ -517,6 +537,35 @@ def extract_delivery_details(text: str) -> dict[str, str]:
     """
     details: dict[str, str] = {}
 
+    # A positional list introduces the slots in the order the Order Agent asks for
+    # them ("update ... with exactly: ang chin tiong; 3 pine grove singapore; 597590;
+    # 97492736"). Parse it first: keyword matching cannot, because the request often
+    # *quotes* the earlier read-back ("recipient name, postal code, and contact number
+    # are still not stored") and the quote is loaded with junk values ("postal code").
+    positional = re.search(
+        r"\bwith\s+exactly\s*:\s*(.+?)(?:\.\s|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if positional:
+        tokens = [t.strip().strip("'\" ") for t in positional.group(1).split(";") if t.strip()]
+        postal = next((t for t in tokens if re.fullmatch(r"\d{6}", t)), "")
+        contact = next((t for t in tokens if re.fullmatch(r"[89]\d{7}", t)), "")
+        address = next(
+            (t for t in tokens if t not in (postal, contact) and re.search(r"\d", t) and len(t) > 3),
+            "",
+        )
+        remaining = [t for t in tokens if t not in (postal, contact, address)]
+        if remaining:
+            details["recipient"] = remaining[0]
+        if address:
+            details["address"] = address
+        if postal:
+            details["postal"] = postal
+        if contact:
+            details["contact"] = contact
+        return details
+
     def _after(keyword: str) -> str:
         match = re.search(
             rf"\b{keyword}\b[^A-Za-z0-9]{{0,8}}([A-Za-z0-9][^,;]*)",
@@ -534,7 +583,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         return value
 
     for slot, keywords in (
-        ("recipient", ("recipient name", "recipient", "deliver to", "ship to", "send to")),
+        ("recipient", ("recipient full name", "recipient name", "recipient", "deliver to", "ship to", "send to")),
         ("address", ("delivery address", "address line", "shipping to", "send to", "address")),
         ("contact", ("contact number", "contact", "phone number", "phone")),
         ("postal", ("postal code", "postal", "postcode")),
@@ -546,7 +595,13 @@ def extract_delivery_details(text: str) -> dict[str, str]:
                 break
         if not raw:
             continue
-        if slot == "contact":
+        if slot == "recipient":
+            # "recipient full name: ang chin tiong" (and "recipient name: x") are
+            # labelled with the slot word itself -- drop that label so the persisted
+            # value is the name, not "full name: ang chin tiong".
+            value = re.sub(r"^\s*(?:full\s+)?name\s*:\s*", "", raw, flags=re.IGNORECASE).strip()
+            details["recipient"] = value if value else raw
+        elif slot == "contact":
             match = re.search(r"([89][0-9]{7})", raw)
             details[slot] = match.group(1) if match else raw
         elif slot == "postal":
@@ -580,6 +635,12 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         match = re.search(r"\bfor ([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)(?:\s+[A-Z][A-Za-z'-]+)?)\b", text)
         if match:
             details["recipient"] = match.group(1)
+    if "recipient" not in details:
+        # "update ... with exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736"
+        # is an unlabelled positional list in the order the Order Agent asks for slots.
+        match = re.search(r"\bwith\s+exactly\s*:\s*([^;.;]{2,64})\s*;", text, re.IGNORECASE)
+        if match:
+            details["recipient"] = match.group(1).strip().strip("'\" ") or details.get("recipient", "")
     if "contact" not in details:
         match = re.search(r"\b([89][0-9]{7})\b", text)
         if match:
@@ -606,7 +667,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             details["recipient"] = match.group(1).strip()
     if "address" not in details:
         match = re.search(
-            r"\b(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|\s{2,}|$)",
+            r"\b(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|;|\s{2,}|$)",
             text,
             re.IGNORECASE,
         )

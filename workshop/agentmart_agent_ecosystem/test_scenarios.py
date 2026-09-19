@@ -661,6 +661,22 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
     ("Verify draft order AM-ORD-20260919-4F77 after this address update. Read back the exact "
      "current status, SKU, quantity, delivery details, total, ETA, payment status, and inventory "
      "reservation status. Do not modify, authorize, capture, or place anything.", "order_status"),
+    # A read-back phrased without the word "verify" is still a LOOKUP: it must outrank the
+    # weak "payment" marker, or the checkout branch would persist junk parsed from the
+    # lookup's own list of field names ("recipient name, full delivery address, postal code,
+    # contact number, SKU ...").
+    ("Perform a fresh order/draft lookup for AM-ORD-20260919-23BE and read back the stored "
+     "recipient name, full delivery address, postal code, contact number, SKU, quantity, total, "
+     "payment status, inventory reservation status, fulfillment method, and order placement "
+     "status. Do not modify anything.", "order_status"),
+    # A correction that quotes the earlier read-only result is still an UPDATE: the quoted
+    # "read-only lookup shows ..." must not downgrade it, and "with exactly:" must survive
+    # strip_prohibitions even after a parenthesised "do not create a duplicate".
+    ("The read-only lookup shows recipient name, postal code, and contact number are still not "
+     "stored. Please update the existing AM-ORD-20260919-23BE only (do not create a duplicate) "
+     "with exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736. Do not authorize "
+     "payment, capture funds, reserve inventory, or place the order. Return whether each field "
+     "was persisted and the resulting status.", "purchase_intent"),
 )
 
 
@@ -710,9 +726,27 @@ def check_extract() -> list[Check]:
         "Verify the exact draft order AM-ORD-20260919-4F77 after the address update. Read back "
         "its current status, SKU, quantity, delivery method, total, payment status."
     )
+    fullname_msg = extract_delivery_details(
+        "Update the staged checkout draft/order AM-ORD-20260919-23BE with these delivery details "
+        "exactly as provided: recipient full name: ang chin tiong; full delivery address: 3 pine "
+        "grove singapore; postal code: 597590; contact number: 97492736. Do not authorize payment, "
+        "capture funds, reserve inventory, or place the order."
+    )
+    positional_msg = extract_delivery_details(
+        "The read-only lookup shows recipient name, postal code, and contact number are still not "
+        "stored. Please update the existing AM-ORD-20260919-23BE only (do not create a duplicate) "
+        "with exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736. Do not authorize "
+        "payment, capture funds, reserve inventory, or place the order."
+    )
     update_expected = {
         "recipient": "ang chin tiong",
         "address": "3 pine grove",
+        "postal": "597590",
+        "contact": "97492736",
+    }
+    fullname_expected = {
+        "recipient": "ang chin tiong",
+        "address": "3 pine grove singapore",
         "postal": "597590",
         "contact": "97492736",
     }
@@ -722,6 +756,8 @@ def check_extract() -> list[Check]:
         expect("colon-labelled 'recipient name:'/address phrasing parses cleanly", update_msg == update_expected),
         expect("'correct and persist ... on draft' extracts the real slots", correct_msg == update_expected),
         expect("a pure verify lookup extracts nothing to persist", verify_msg == {}),
+        expect("'recipient full name:' labelled phrasing parses cleanly", fullname_msg == fullname_expected),
+        expect("'with exactly:' positional list parses cleanly despite a leading quote", positional_msg == fullname_expected),
     ]
 
 
@@ -777,6 +813,78 @@ def run_update_then_verify(dry_run: bool, verbose: bool) -> tuple[list[Check], d
     return checks, verify
 
 
+def run_quote_correct_and_reupdate(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """The full live failure loop: update -> lookup (misroute hazard) -> re-update.
+
+    A read-back that named its own fields once corrupted the order via the checkout
+    branch; a re-update that quoted the read-only result then got downgraded and never
+    persisted. Both must now be inert or effective respectively.
+    """
+    buy = run_agentmart("I want to buy this AM-EAR-1002.", dry_run=dry_run, channel="telegram")
+    draft_id = buy.get("draft_order", {}).get("order_id")
+    oid = draft_id or "AM-ORD-TBD"
+
+    update = run_agentmart(
+        ("Update the staged checkout draft/order {0} with these delivery details exactly as "
+         "provided: recipient full name: ang chin tiong; full delivery address: 3 pine grove "
+         "singapore; postal code: 597590; contact number: 97492736. Do not authorize payment, "
+         "capture funds, reserve inventory, or place the order.").format(oid),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    lookup = run_agentmart(
+        ("Perform a fresh order/draft lookup for {0} and read back the stored recipient name, "
+         "full delivery address, postal code, contact number, SKU, quantity, total, payment "
+         "status, inventory reservation status, fulfillment method, and order placement status. "
+         "Do not modify anything.").format(oid),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    before = get_order(draft_id) if draft_id else {}
+    recipient_before = before.get("delivery_recipient")
+    address_before = before.get("delivery_address")
+
+    reupdate = run_agentmart(
+        ("The read-only lookup shows recipient name, postal code, and contact number are still "
+         "not stored. Please update the existing {0} only (do not create a duplicate) with "
+         "exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736. Do not authorize "
+         "payment, capture funds, reserve inventory, or place the order. Return whether each "
+         "field was persisted and the resulting status.").format(oid),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+    after = get_order(draft_id) if draft_id else {}
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 2 routed to drafting, not checkout_payment", update.get("intent") == "purchase_intent"),
+        expect("turn 3 lookup stayed read-only (not checkout_payment)", lookup.get("intent") == "order_status"),
+        expect("turn 3 did not run the payment agent", "payment_agent" not in agents_visited(lookup)),
+        expect("the lookup did not clobber the persisted recipient", recipient_before == "ang chin tiong"),
+        expect(
+            "the lookup did not clobber the persisted address",
+            address_before == "3 pine grove singapore",
+        ),
+        expect("turn 4 re-update routed to drafting despite the quoted 'read-only'", reupdate.get("intent") == "purchase_intent"),
+        expect("turn 4 did not run the payment agent", "payment_agent" not in agents_visited(reupdate)),
+    ]
+    if draft_id:
+        checks.append(
+            expect(
+                "all four slots persisted intact after the full sequence",
+                (
+                    after.get("delivery_recipient") == "ang chin tiong"
+                    and after.get("delivery_address") == "3 pine grove singapore"
+                    and after.get("delivery_postal") == "597590"
+                    and after.get("delivery_contact") == "97492736"
+                ),
+            )
+        )
+    return checks, reupdate
+
+
 def run_scenario(scenario: Scenario, dry_run: bool, verbose: bool) -> list[Check]:
     result = run_agentmart(
         scenario.request,
@@ -823,6 +931,7 @@ def main() -> int:
         print(f"{'draft-refresh':<24} {'(chained)':<17} re-quote a draft: reused, never charged")
         print(f"{'draft-needs-fields':<24} {'(chained)':<17} partial delivery: ask, then complete the draft")
         print(f"{'update-then-verify':<24} {'(chained)':<17} update a draft, then verify it read-only")
+        print(f"{'quote-correct-and-reupdate':<24} {'(chained)':<17} update -> lookup -> quoted correction")
         print(f"{'intent-routing':<24} {'(routing)':<17} phrasings, human and agent-generated")
         return 0
 
@@ -831,7 +940,7 @@ def main() -> int:
     run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify"}
+        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify", "quote-correct-and-reupdate"}
         unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -900,6 +1009,12 @@ def main() -> int:
             run_update_then_verify,
             "Buy AM-EAR-1002 -> update address -> verify (must not clobber).",
             "A read-back after an address update stays read-only.",
+        ),
+        (
+            "quote-correct-and-reupdate",
+            run_quote_correct_and_reupdate,
+            "Buy AM-EAR-1002 -> update -> lookup -> quoted correction.",
+            "A quoted read-only result must not downgrade the corrective update.",
         ),
     ]
     for name, fn, request, describes in chained:
