@@ -644,8 +644,36 @@ def extract_delivery_details(text: str) -> dict[str, str]:
                 value = match.group(1) if match else value
             elif slot == "recipient":
                 value = re.sub(r"^\s*(?:full\s+)?name\s*:\s*", "", value, flags=re.IGNORECASE).strip()
-            if value:
-                details[slot] = value
+            if not value:
+                continue
+            # A readback enumeration is a list of the *labels themselves* ("recipient
+            # full name, complete delivery address, postal code, contact number, and
+            # delivery method are still missing"), so each _after(label) capture lands
+            # on the NEXT label, not on data. Persisting it stores a slot label as a
+            # slot value (recipient => "complete delivery address", postal => "contact
+            # number"), which is exactly the shift an earlier peer observed. Reject any
+            # captured value that is itself one of the slot labels / label phrases.
+            if any(
+                re.search(rf"\b{re.escape(label)}\b", value, re.IGNORECASE)
+                for label in (
+                    *DELIVERY_SLOT_LABELS.values(),
+                    "recipient full name",
+                    "recipient name",
+                    "full name",
+                    "complete delivery address",
+                    "full delivery address",
+                    "delivery address",
+                    "address",
+                    "postal code",
+                    "postal",
+                    "postcode",
+                    "contact number",
+                    "contact",
+                    "delivery method",
+                )
+            ):
+                continue
+            details[slot] = value
         return details
 
     def _after(keyword: str) -> str:
@@ -662,6 +690,28 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         value = re.sub(r"[^A-Za-z0-9\s'\"-]+$", "", value).strip().strip("'\" ").strip()
         if len(value) > 48:
             value = value[:48].rsplit(" ", 1)[0]
+        # A labelled list the peer read back as still-missing ("...recipient full
+        # name, complete delivery address, postal code, contact number, and
+        # delivery method are missing from the draft") assigns each keyword's
+        # _after() capture the NEXT slot label, not a value: recipient lands on
+        # "complete delivery address", postal on "contact number", contact on
+        # "delivery method". That is a label quote, not deliverable data, so
+        # reject any capture whose value STARTS with a slot label or label
+        # fragment ("full name", "code", "and delivery method ..."). Real values
+        # never start with one: an address always begins with its house number
+        # (already enforced down the loop), and recipient/postal/contact data
+        # never begins with a label word. Let the caller's `if not raw: continue`
+        # skip the slot entirely.
+        if re.match(
+            r"\s*(?:and\s+)?(?:recipient\b|(?:full\s+)?name\b|complete\s+delivery\s+"
+            r"address\b|full\s+delivery\s+address\b|delivery\s+address\b|address\b|"
+            r"postal\s+code\b|postal\b|postcode\b|code\b|contact\s+number\b|contact\b|"
+            r"number\b|delivery\s+method\b|delivery\s+details\b|delivery\b|method\b|"
+            r"details\b|details\b)",
+            value,
+            re.IGNORECASE,
+        ):
+            return ""
         return value
 
     for slot, keywords in (
