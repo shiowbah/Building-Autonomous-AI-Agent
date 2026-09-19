@@ -312,7 +312,27 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        # 1. Read-only/verification phrasings never settle anything. Remote peers
+        # 1. An explicit settle/pay imperative is CHECKOUT even when the message
+        # also asks to read back the result afterwards ("...then perform an
+        # order-status lookup"). That trailing verification clause must NOT
+        # downgrade a charge to a no-op lookup, or Hermes could say "proceed to
+        # checkout and payment" yet never wake the Payment Agent. Guardrail noun
+        # phrases like "checkout draft/step" stay drafting, and a bare mention
+        # of "checkout." as a noun must not settle anything.
+        "checkout_payment",
+        re.compile(
+            r"\bcheck\s?out\s+and\s+pay(?:ment)?\b|"
+            r"\bpay\s+(?:for|now|to)\b|"
+            r"\bplace\s+the\s+order\b|"
+            r"\bsettle\s+(?:the\s+)?(?:order|bill|up)\b|"
+            r"\bproceed\s+(?:with|to)\s+(?:the\s+)?(?:checkout|payment)\b|"
+            r"\battempt\s+(?:the\s+)?(?:secure\s+)?(?:payment\s+)?authorization\b|"
+            r"\bpay\s+(?:for\s+)?(?:my|this|the)\s+order\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # 2. Read-only/verification phrasings never settle anything. Remote peers
         # state their own guardrails inline ("Read-only verification only"), so the
         # markers here mean "lookup", not "charge". A real checkout that happens to
         # verify the cart first is NOT matched (no read-only marker in it), so it

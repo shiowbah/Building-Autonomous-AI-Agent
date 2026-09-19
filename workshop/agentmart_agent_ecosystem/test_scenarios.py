@@ -627,6 +627,24 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
      "recipient Ang Chin Tiong; contact number 97492736; standard delivery. Before payment, "
      "verify the cart contains only this SKU and return the final item price, shipping, "
      "taxes/fees, total, and payment method identifier. Do not substitute items.", "checkout_payment"),
+    # A checkout that trails a "then read back the result / do a status lookup" clause is
+    # STILL a checkout: the follow-up lookup must not downgrade the settle-and-pay into a
+    # no-op order_status read (which previously left the order unpaid forever).
+    ("I confirm the existing draft AM-ORD-20260919-BA95 for 1 x Nimbus Air 2 (SKU "
+     "AM-EAR-1002), standard delivery, total $89.00. Please proceed with checkout and "
+     "payment for this existing draft only. Do not create a duplicate order. Use the approved "
+     "payment method already available through the secure payment flow; never request or "
+     "expose card numbers, CVCs, passwords, or one-time codes in chat. After attempting "
+     "payment, perform an order-status lookup and return the exact order ID, final status, "
+     "amount paid, payment status, delivery method, estimated delivery date, tracking number, "
+     "and inventory reservation status. If payment cannot proceed, leave the order unpaid "
+     "and report the blocker.", "checkout_payment"),
+    ("The order is still unpaid. Please explicitly attempt the secure payment authorization "
+     "and checkout for the existing draft AM-ORD-20260919-BA95 now, using only an approved "
+     "payment method already available to you. Do not ask me for or handle card details, "
+     "passwords, or one-time codes in chat; if no payment method or secure authorization is "
+     "available, state that exact blocker and leave the draft unchanged. Then read back the "
+     "payment result and order status.", "checkout_payment"),
     # Recording intent only, with an express ban on creating orders, still routes to
     # purchase_intent; the Order Agent then decides draft/no-draft from whether a SKU
     # is named (a named SKU means the customer wants to buy, so it drafts and asks
