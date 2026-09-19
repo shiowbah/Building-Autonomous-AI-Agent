@@ -709,6 +709,25 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
      "full delivery address 25 Heng Mui Keng Terrace Singapore, postal code 119615, and contact "
      "number 65162093. Then verify and return the exact persisted delivery fields and draft "
      "status.", "purchase_intent"),
+    # "Verify by reading back ..." is a LOOKUP (the phrase is "reading back", not the
+    # literal "read back"), and must NOT wake the Payment Agent via the weak payment
+    # marker. If it does, its own field-name list ("recipient name, full delivery
+    # address, postal code, contact number, SKU ...") is re-parsed as delivery slots
+    # and corrupts the draft.
+    ("Verify by reading back draft/order AM-ORD-20260919-CBB3 now. Return the exact stored "
+     "recipient name, full delivery address, postal code, contact number, SKU, quantity, total, "
+     "payment status, placement status, and inventory reservation status. Do not modify or place "
+     "the order.", "order_status"),
+    # A correction that leads with the readback quote ("... recipient name, postal code, and
+     # contact number are missing") and then fills "these exact missing fields:" is an UPDATE,
+     # not a lookup -- the readback marker + "draft" must not downgrade it, and the quote's junk
+     # field names must not win extraction over the labelled field list.
+     ("The readback shows only the address persisted; recipient name, postal code, and contact "
+      "number are missing. Correct the existing draft AM-ORD-20260919-CBB3 in place\u2014do not "
+      "create a duplicate, authorize payment, or place an order. Save these exact missing fields: "
+      "recipient name David Neo; postal code 119615; contact number 65162093. Keep the draft "
+      "unpaid and do not change the SKU, quantity, address, or total. Then report the update "
+      "result.", "purchase_intent"),
 )
 
 
@@ -781,6 +800,18 @@ def check_extract() -> list[Check]:
         "full delivery address 25 Heng Mui Keng Terrace Singapore, postal code 119615, and contact "
         "number 65162093. Then verify and return the exact persisted delivery fields and draft status."
     )
+    missing_fields_msg = extract_delivery_details(
+        "The readback shows only the address persisted; recipient name, postal code, and contact "
+        "number are missing. Correct the existing draft AM-ORD-20260919-CBB3 in place\u2014do not "
+        "create a duplicate, authorize payment, or place an order. Save these exact missing fields: "
+        "recipient name David Neo; postal code 119615; contact number 65162093. Keep the draft "
+        "unpaid and do not change the SKU, quantity, address, or total. Then report the update result."
+    )
+    missing_fields_expected = {
+        "recipient": "David Neo",
+        "postal": "119615",
+        "contact": "65162093",
+    }
     fullname_label_expected = {
         "recipient": "David Neo",
         "address": "25 Heng Mui Keng Terrace Singapore",
@@ -809,6 +840,7 @@ def check_extract() -> list[Check]:
         expect("'with exactly:' positional list parses cleanly despite a leading quote", positional_msg == fullname_expected),
         expect("bare 'full name:' label parses the recipient", fullname_label_msg == fullname_label_expected),
         expect("confirm-then-retry update extracts all four slots", retry_msg == fullname_label_expected),
+        expect("'these exact missing fields:' list wins over the readback quote", missing_fields_msg == missing_fields_expected),
     ]
 
 

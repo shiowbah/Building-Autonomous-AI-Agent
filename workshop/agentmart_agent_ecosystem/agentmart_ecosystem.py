@@ -307,7 +307,9 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
             r"[^.?]{0,200}\bwith\s+(?:exactly|these|those|the\s+following|recipient|delivery|address)\b|"
             r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
-            r"[^.?]{0,120}\bdelivery\s+(?:details|address)\b",
+            r"[^.?]{0,120}\bdelivery\s+(?:details|address)\b|"
+            r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
+            r"[^.?]{0,160}\b(?:these|those)\s+(?:exact\s+)?(?:missing\s+)?fields?\s*:",
             re.IGNORECASE,
         ),
     ),
@@ -347,8 +349,8 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"\breconcil(?:iation|ing)?\b|"
             r"\baudit\b|"
             r"confirm\s+(?:whether|if)\s+no\b|"
-            r"\bverif\w*\b.{0,220}\b(?:read\s*back|by\s+looking\s+it\s+up|current\s+status|order\s+status)\b|"
-            r"\b(?:read\s*back|look\s+it\s+up|lookup)\b.{0,220}\b(?:stored|status|order\b|draft\b)",
+            r"\bverif\w*\b.{0,220}\b(?:read\w*\s*back|by\s+looking\s+it\s+up|current\s+status|order\s+status)\b|"
+            r"\b(?:read\w*\s*back|look\s+it\s+up|lookup)\b.{0,220}\b(?:stored|status|order\b|draft\b)",
             re.IGNORECASE,
         ),
     ),
@@ -584,6 +586,49 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             details["postal"] = postal
         if contact:
             details["contact"] = contact
+        return details
+
+    # A labelled "save these exact missing fields: ..." list. The peer's own
+    # readback quote ahead of it is loaded with junk ("recipient name, postal
+    # code, and contact number are missing"), so keyword matching on the whole
+    # request would persist "postal code" as the recipient. The fields list is
+    # authoritative: parse the semicolon-separated label/value pairs it names.
+    fields_list = re.search(
+        r"\b(?:these|those)\s+(?:exact\s+)?(?:missing\s+)?fields?\s*:\s*(.+?)(?:\.\s|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if fields_list:
+        for token in fields_list.group(1).split(";"):
+            token = token.strip().strip("'\" ")
+            if not token:
+                continue
+            slot = next(
+                (
+                    s
+                    for s in ("recipient", "postal", "contact")
+                    if re.match(rf"^{re.escape(DELIVERY_SLOT_LABELS[s])}\s*:?\s*", token, re.IGNORECASE)
+                ),
+                None,
+            )
+            if not slot:
+                if re.match(r"^(?:full\s+)?(?:delivery\s+)?address\b", token, re.IGNORECASE):
+                    slot = "address"
+            if not slot:
+                continue
+            value = re.sub(
+                rf"^{re.escape(DELIVERY_SLOT_LABELS[slot])}\s*:?\s*", "", token, flags=re.IGNORECASE
+            ).strip().strip("'\" ")
+            if slot == "postal":
+                match = re.search(r"([0-9]{6})", value)
+                value = match.group(1) if match else value
+            elif slot == "contact":
+                match = re.search(r"([89][0-9]{7})", value)
+                value = match.group(1) if match else value
+            elif slot == "recipient":
+                value = re.sub(r"^\s*(?:full\s+)?name\s*:\s*", "", value, flags=re.IGNORECASE).strip()
+            if value:
+                details[slot] = value
         return details
 
     def _after(keyword: str) -> str:
