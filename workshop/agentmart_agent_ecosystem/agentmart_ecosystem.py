@@ -300,14 +300,18 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # state their own guardrails inline ("Read-only verification only"), so the
         # markers here mean "lookup", not "charge". A real checkout that happens to
         # verify the cart first is NOT matched (no read-only marker in it), so it
-        # still lands on the payment path.
+        # still lands on the payment path. A *lookup* phrased as "verify … read
+        # back / by looking it up / current status" is the same read-only intent:
+        # routing it as a purchase_intent would re-persist junk slots parsed from
+        # phrases like "after the address update".
         "order_status",
         re.compile(
             r"read[\s-]?only\b|"
             r"verif\w*\s+only\b|"
             r"\breconcil(?:iation|ing)?\b|"
             r"\baudit\b|"
-            r"confirm\s+(?:whether|if)\s+no\b",
+            r"confirm\s+(?:whether|if)\s+no\b|"
+            r"\bverif\w*\b.{0,220}\b(?:read\s*back|by\s+looking\s+it\s+up|current\s+status|order\s+status)\b",
             re.IGNORECASE,
         ),
     ),
@@ -325,10 +329,10 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"(?:create|prepare|make|write|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
             r"(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
-            r"(?:create|prepare|make|write|set\s*up|update|refresh)\b[^.]{0,80}\bdraft\b|"
-            r"(?:draft|checkout)\s+order\b",
-            re.IGNORECASE,
-        ),
+r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b|"
+        r"(?:draft|checkout)\s+order\b",
+        re.IGNORECASE,
+    ),
     ),
     (
         # 2. Unambiguous checkout imperatives. "checkout draft" is a noun phrase,
@@ -430,7 +434,7 @@ INTENT_ONLY_BLOCK = re.compile(
     re.IGNORECASE,
 )
 INTENT_ONLY_DRAFT = re.compile(
-    r"(?:create|prepare|make|write|set\s*up|update|refresh)\b[^.]{0,80}\bdraft\b",
+    r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b",
     re.IGNORECASE,
 )
 
@@ -530,8 +534,8 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         return value
 
     for slot, keywords in (
-        ("recipient", ("recipient", "recipient name", "deliver to", "ship to", "send to")),
-        ("address", ("address line", "delivery address", "shipping to", "send to", "address")),
+        ("recipient", ("recipient name", "recipient", "deliver to", "ship to", "send to")),
+        ("address", ("delivery address", "address line", "shipping to", "send to", "address")),
         ("contact", ("contact number", "contact", "phone number", "phone")),
         ("postal", ("postal code", "postal", "postcode")),
     ):
@@ -548,6 +552,27 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         elif slot == "postal":
             match = re.search(r"([0-9]{6})", raw)
             details[slot] = match.group(1) if match else raw
+        elif slot == "address":
+            value = raw
+            # Strip leading filler the peer may have used ("delivery address
+            # exactly: 3 pine grove" => "3 pine grove"), then drop junk values
+            # that are really about the request itself ("after the address update",
+            # "on draft AM-ORD-2026..."). A real street always leads with a house
+            # number here, so require one before accepting the slot.
+            value = re.sub(
+                r"^(?:exactly|precisely|just|the|a|an|of|below|following|updated|new|current)\s*[:]?\s*",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            )
+            value = re.sub(r"[^A-Za-z0-9\s'\"-]+$", "", value).strip().strip("'\" ").strip()
+            if len(value) > 48:
+                value = value[:48].rsplit(" ", 1)[0]
+            if re.search(r"\b(?:draft|update|updated|sku|order)\b", value, re.IGNORECASE):
+                continue
+            if not re.search(r"\d{1,6}\s+[A-Za-z]", value):
+                continue
+            details[slot] = value
         else:
             details[slot] = raw
 
@@ -581,8 +606,9 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             details["recipient"] = match.group(1).strip()
     if "address" not in details:
         match = re.search(
-            r"\b(\d{1,6}\s+[A-Z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|\s{2,}|$)",
+            r"\b(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|\s{2,}|$)",
             text,
+            re.IGNORECASE,
         )
         if match:
             details["address"] = (

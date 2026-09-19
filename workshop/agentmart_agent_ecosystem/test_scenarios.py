@@ -640,6 +640,27 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
      "prepare a checkout draft for quantity 1 using the previously provided destination "
      "(Singapore 597590). Do not place the order, reserve stock, authorize payment, or "
      "capture funds. Return the draft status and any missing checkout details.", "purchase_intent"),
+    # A peer correctness message ("correct and persist the delivery address on draft X")
+    # is an UPDATE, not a read-only lookup that falls back on the order id. It must
+    # route to purchase_intent even though the SKU/value words are embedded mid-sentence.
+    ("Correct and persist the delivery address on draft AM-ORD-20260919-4F77. Use exactly: "
+     "3 pine grove, astor green, singapore. Keep the previously provided recipient name ang "
+     "chin tiong, postal code 597590, contact number 97492736, SKU AM-EAR-1002, quantity 1, "
+     "and standard delivery. Do not authorize payment, capture funds, or place the order. "
+     "Return the updated draft state.", "purchase_intent"),
+    # Verify/read-back messages about a draft are LOOKUPS, even when they reference an
+    # order id and mention address changes, and must NOT ride the purchase_intent path
+    # (which would re-persist junk extracted from "after the address update").
+    ("Verify the exact draft order AM-ORD-20260919-4F77 after the address update. Read back "
+     "its current status, SKU, quantity, delivery method, total, payment status, inventory "
+     "reservation status, and any taxes/fees or remaining missing details. Do not modify, "
+     "authorize, capture, or place it.", "order_status"),
+    ("Verify the exact draft order AM-ORD-20260919-4F77 by looking it up. Return its current "
+     "status, SKU, quantity, payment status, total, and whether inventory is reserved. Do not "
+     "modify, authorize, capture, or place anything.", "order_status"),
+    ("Verify draft order AM-ORD-20260919-4F77 after this address update. Read back the exact "
+     "current status, SKU, quantity, delivery details, total, ETA, payment status, and inventory "
+     "reservation status. Do not modify, authorize, capture, or place anything.", "order_status"),
 )
 
 
@@ -674,10 +695,86 @@ def check_extract() -> list[Check]:
         "postal": "597590",
         "contact": "97492736",
     }
+    update_msg = extract_delivery_details(
+        "Update draft order AM-ORD-20260919-4F77 with these delivery details exactly as "
+        "provided: recipient name: ang chin tiong; full delivery address: 3 pine grove; "
+        "postal code: 597590; contact number: 97492736."
+    )
+    correct_msg = extract_delivery_details(
+        "Correct and persist the delivery address on draft AM-ORD-20260919-4F77. Use exactly: "
+        "3 pine grove, astor green, singapore. Keep the previously provided recipient name ang "
+        "chin tiong, postal code 597590, contact number 97492736, SKU AM-EAR-1002, quantity 1, "
+        "and standard delivery."
+    )
+    verify_msg = extract_delivery_details(
+        "Verify the exact draft order AM-ORD-20260919-4F77 after the address update. Read back "
+        "its current status, SKU, quantity, delivery method, total, payment status."
+    )
+    update_expected = {
+        "recipient": "ang chin tiong",
+        "address": "3 pine grove",
+        "postal": "597590",
+        "contact": "97492736",
+    }
     return [
         expect("unlabelled 'Use delivery details:' phrasing parses all four slots", unlabelled == expected),
         expect("labelled recipient/address/postal/contact phrasing parses all four slots", labelled == expected),
+        expect("colon-labelled 'recipient name:'/address phrasing parses cleanly", update_msg == update_expected),
+        expect("'correct and persist ... on draft' extracts the real slots", correct_msg == update_expected),
+        expect("a pure verify lookup extracts nothing to persist", verify_msg == {}),
     ]
+
+
+def run_update_then_verify(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """The live failure: an update lands, then a read-back must not clobber it.
+
+    Reproduces the exact Hermes phrasing that corrupted AM-ORD-20260919-4F77 (the
+    verify reply now routes to order_status and extracts nothing, so the address the
+    update persisted is left untouched).
+    """
+    buy = run_agentmart("I want to buy this AM-EAR-1002.", dry_run=dry_run, channel="telegram")
+    draft_id = buy.get("draft_order", {}).get("order_id")
+
+    update = run_agentmart(
+        ("Update draft order {0} with these delivery details exactly as provided: "
+         "recipient name: ang chin tiong; full delivery address: 3 pine grove; "
+         "postal code: 597590; contact number: 97492736. Keep quantity 1, SKU "
+         "AM-EAR-1002, and standard delivery. Do not place the order, authorize "
+         "payment, or capture funds.").format(draft_id or "AM-ORD-TBD"),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    verify = run_agentmart(
+        ("Verify the exact draft order {0} after the address update. Read back its "
+         "current status, SKU, quantity, delivery method, total, payment status, "
+         "inventory reservation status, and any taxes/fees or remaining missing "
+         "details. Do not modify, authorize, capture, or place it.").format(draft_id or "AM-ORD-TBD"),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 2 routed to drafting, not checkout_payment", update.get("intent") == "purchase_intent"),
+        expect("turn 3 verify routed to a read-only lookup", verify.get("intent") == "order_status"),
+        expect("turn 3 did not run the payment agent", "payment_agent" not in agents_visited(verify)),
+        expect("turn 3 did not draft or refresh anything", not verify.get("draft_order")),
+    ]
+    if draft_id:
+        persisted = get_order(draft_id)
+        checks.append(
+            expect(
+                "delivery slots persisted on the draft by the update",
+                (
+                    persisted.get("delivery_recipient") == "ang chin tiong"
+                    and persisted.get("delivery_address") == "3 pine grove"
+                    and persisted.get("delivery_postal") == "597590"
+                    and persisted.get("delivery_contact") == "97492736"
+                ),
+            )
+        )
+    return checks, verify
 
 
 def run_scenario(scenario: Scenario, dry_run: bool, verbose: bool) -> list[Check]:
@@ -725,6 +822,7 @@ def main() -> int:
         print(f"{'buy-then-checkout':<24} {'(chained)':<17} purchase a SKU, then settle that order")
         print(f"{'draft-refresh':<24} {'(chained)':<17} re-quote a draft: reused, never charged")
         print(f"{'draft-needs-fields':<24} {'(chained)':<17} partial delivery: ask, then complete the draft")
+        print(f"{'update-then-verify':<24} {'(chained)':<17} update a draft, then verify it read-only")
         print(f"{'intent-routing':<24} {'(routing)':<17} phrasings, human and agent-generated")
         return 0
 
@@ -733,7 +831,7 @@ def main() -> int:
     run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields"}
+        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify"}
         unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -796,6 +894,12 @@ def main() -> int:
             run_draft_needs_fields,
             "Buy AM-EAR-1002 -> complete the delivery details.",
             "Missing delivery slots are named, then a full update clears them.",
+        ),
+        (
+            "update-then-verify",
+            run_update_then_verify,
+            "Buy AM-EAR-1002 -> update address -> verify (must not clobber).",
+            "A read-back after an address update stays read-only.",
         ),
     ]
     for name, fn, request, describes in chained:
