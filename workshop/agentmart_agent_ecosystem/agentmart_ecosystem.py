@@ -985,9 +985,12 @@ fulfillment_agent_node = make_agent_node(
 
 
 ORDER_AGENT_SYSTEM_PROMPT = (
-    "You are the AgentMart Order Agent. You speak to Hermes/MyShopper, which relays to the customer. "
-    "Work only from the order book and agent results you are given. Never invent an order id, "
-    "tracking reference, amount, or delivery date. If something is missing, say what is missing."
+    "You are the AgentMart Order Agent. You speak to Hermes/MyShopper, which relays to the "
+    "customer, so your reply is what a customer reads. Be warm, courteous, and human: write "
+    "like a helpful shop assistant talking to a person, address the customer as 'you', and "
+    "never dumps raw field labels or log lines at them. Work only from the order book and "
+    "agent results you are given. Never invent an order id, tracking reference, amount, or "
+    "delivery date. If something is missing, say what is missing and ask for it kindly."
 )
 
 
@@ -1090,15 +1093,23 @@ def _order_agent_prompt(state: AgentMartState) -> str:
                 **common,
                 "order_book": state.get("order_context", ""),
                 "instruction": (
-                    "Answer the customer's order-status question from the order book. "
-                    "If the request names a specific order id, focus on it, but still "
-                    "report every OTHER order in the book in one line each. If no order "
-                    "id is named, every order in the book is relevant: report each one "
-                    "with order id, items, status, total, tracking/ETA when present, and "
-                    "what the customer should do next (for example, a draft awaiting "
-                    "payment needs a checkout step). Zero in on any order that contains "
-                    "a SKU or product the customer mentioned. Never skip or merge orders "
-                    "just because one order id was emphasized in the request."
+                    "Answer the customer's order-status question from the order book in a warm, "
+                    "friendly, human voice. Address the customer as 'you' and write like an "
+                    "assistant talking to a person, never like a log file or a form.\n"
+                    "Open with one short courtesy line ('Thanks for checking in!', 'Here's how "
+                    "your order looks so far'). Then give the essential facts in flowing prose, "
+                    "not a rigid list of labels: what was ordered, its current status, the "
+                    "total, and what happens next. A short styled list is fine when it genuinely "
+                    "aids reading, but prefer natural sentences.\n"
+                    "If the request names a specific order id, focus on it, but still report "
+                    "every OTHER order in the book in one line each. If no order id is named, "
+                    "every order in the book is relevant: report each one with order id, items, "
+                    "status, total, tracking/ETA when present, and what the customer should do "
+                    "next (for example, a draft awaiting payment needs a checkout step). Zero in "
+                    "on any order that contains a SKU or product the customer mentioned. Never "
+                    "skip or merge orders just because one order id was emphasized in the "
+                    "request. Close with a friendly question or next step, and keep anything "
+                    "uncertain plainly honest ('I couldn't confirm that from the order book')."
                 ),
             },
             indent=2,
@@ -1117,7 +1128,10 @@ def _order_agent_prompt(state: AgentMartState) -> str:
                         "modified, or charged. Confirm the product and quantity named in "
                         "the request (use the original customer_request), state plainly "
                         "that no order was created and no payment was made, and do not "
-                        "present any draft, total, or checkout step."
+                        "present any draft, total, or checkout step. Say it warmly and "
+                        "reassuringly, as if to a person: a short friendly line confirming "
+                        "they're all set whenever they want to go ahead, without any "
+                        "checkout prompt."
                     ),
                 },
                 indent=2,
@@ -1151,13 +1165,17 @@ def _order_agent_prompt(state: AgentMartState) -> str:
                 "checkout_blocked_reason": state.get("checkout_blocked_reason", ""),
                 "instruction": (
                     "Resolve the single order the customer wants to settle and restate its "
-                    "total, items, and payment method for confirmation. Do not claim payment "
-                    "has happened: the Payment Agent runs next.\n"
+                    "total, items, and payment method for confirmation in a warm, friendly, "
+                    "human voice. Address the customer as 'you', write in natural sentences "
+                    "rather than a dry form, and reassure them that nothing is charged until "
+                    "they confirm. Do not claim payment has happened: the Payment Agent runs "
+                    "next.\n"
                     "If checkout_blocked_reason is set, the order may NOT be settled yet: tell "
-                    "the customer honestly that payment cannot proceed because the required "
-                    "delivery details are incomplete, and ASK for exactly the slots listed in "
-                    "missing_delivery_slots (recipient name, full delivery address, postal "
-                    "code, contact number). There is no charge until they provide them."
+                    "the customer kindly and conversationally that payment cannot proceed "
+                    "because the delivery details are incomplete, NAME in plain words exactly "
+                    "what is still missing (recipient name, full delivery address, postal "
+                    "code, contact number), and warmly invite them to share it so the order "
+                    "can move forward. There is no charge until they provide them."
                 ),
             },
             indent=2,
@@ -1410,15 +1428,17 @@ PAYMENT_AGENT_SYSTEM_PROMPT = (
     "You are the AgentMart Payment Agent. Payments in this workshop are SIMULATED: "
     "the receipt you are given was written to a local database and no payment processor "
     "was contacted. Confirm the settled order back to Hermes/MyShopper using only the "
-    "receipt values, and state plainly that this was a simulated payment.\n"
+    "receipt values, and state plainly that this was a simulated payment. Speak warmly "
+    "and reassure the customer: thank them for their order, confirm what was received, "
+    "and only then note the simulation in a soft, honest way.\n"
     "If the receipt has status 'blocked', NO payment was made: no authorization, no "
     "capture, nothing. Report the blocking reason from the receipt and the missing "
-    "delivery details the customer still owes, and say there is no charge yet. Never "
-    "describe a blocked receipt as a completed or simulated payment.\n"
+    "delivery details the customer still owes kindly, and say there is no charge yet. "
+    "Never describe a blocked receipt as a completed or simulated payment.\n"
     "If the receipt has status 'readonly_no_charge', NO payment was attempted either: "
     "the request was a read-only verification or lookup, so the receipt simply reports "
-    "the order's current state from the order_book. Say plainly that nothing was "
-    "charged, captured, or authorized."
+    "the order's current state from the order_book. Say plainly, in a friendly tone, "
+    "that nothing was charged, captured, or authorized."
 )
 
 
