@@ -728,6 +728,15 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
       "recipient name David Neo; postal code 119615; contact number 65162093. Keep the draft "
       "unpaid and do not change the SKU, quantity, address, or total. Then report the update "
       "result.", "purchase_intent"),
+    # The operator's live regression inputs (relayed by Hermes verbatim). The bare
+    # delivery tuple has no verb at all, so it must fall through every checkout,
+    # status, draft, buy and browse marker to the tuple rule and become an update.
+    ("Find me wireless earbuds under $120 with good battery life.", "product_advice"),
+    ("What is my order status?", "order_status"),
+    ("List the available products.", "browse_catalog"),
+    ("I want to buy AM-EAR-1002.", "purchase_intent"),
+    ("David Neo, 25 Heng Mui Keng Terrace Singapore, 119615, 65162093", "purchase_intent"),
+    ("Checkout and pay for my order.", "checkout_payment"),
 )
 
 
@@ -807,6 +816,19 @@ def check_extract() -> list[Check]:
         "recipient name David Neo; postal code 119615; contact number 65162093. Keep the draft "
         "unpaid and do not change the SKU, quantity, address, or total. Then report the update result."
     )
+    bare_tuple_msg = extract_delivery_details(
+        "David Neo, 25 Heng Mui Keng Terrace Singapore, 119615, 65162093"
+    )
+    labelled_area_msg = extract_delivery_details(
+        "Update the existing draft order AM-ORD-20260919-5E10 with these delivery details: "
+        "recipient name David Neo; full delivery address 25 Heng Mui Keng Terrace, Singapore; "
+        "postal code 119615; contact number 65162093."
+    )
+    checkout_sku_msg = extract_delivery_details(
+        "I authorize checkout and payment for the existing order AM-ORD-20260919-5E10: "
+        "1 \u00d7 AM-EAR-1002 Nimbus Air 2, total $89.00, standard delivery to the verified "
+        "address."
+    )
     missing_fields_expected = {
         "recipient": "David Neo",
         "postal": "119615",
@@ -830,6 +852,18 @@ def check_extract() -> list[Check]:
         "postal": "597590",
         "contact": "97492736",
     }
+    bare_tuple_expected = {
+        "recipient": "David Neo",
+        "address": "25 Heng Mui Keng Terrace Singapore",
+        "postal": "119615",
+        "contact": "65162093",
+    }
+    labelled_area_expected = {
+        "recipient": "David Neo",
+        "address": "25 Heng Mui Keng Terrace, Singapore",
+        "postal": "119615",
+        "contact": "65162093",
+    }
     return [
         expect("unlabelled 'Use delivery details:' phrasing parses all four slots", unlabelled == expected),
         expect("labelled recipient/address/postal/contact phrasing parses all four slots", labelled == expected),
@@ -841,6 +875,9 @@ def check_extract() -> list[Check]:
         expect("bare 'full name:' label parses the recipient", fullname_label_msg == fullname_label_expected),
         expect("confirm-then-retry update extracts all four slots", retry_msg == fullname_label_expected),
         expect("'these exact missing fields:' list wins over the readback quote", missing_fields_msg == missing_fields_expected),
+        expect("a bare comma-separated tuple fills all four slots", bare_tuple_msg == bare_tuple_expected),
+        expect("a labelled address keeps its comma+area ('..., Singapore')", labelled_area_msg == labelled_area_expected),
+        expect("a checkout's SKU phrase is never parsed as the address", checkout_sku_msg == {}),
     ]
 
 
@@ -968,6 +1005,60 @@ def run_quote_correct_and_reupdate(dry_run: bool, verbose: bool) -> tuple[list[C
     return checks, reupdate
 
 
+def run_bare_tuple_then_checkout(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """The operator's live regression, turn for turn.
+
+    Buy AM-EAR-1002, then relay the bare tuple ("David Neo, 25 Heng Mui Keng
+    Terrace Singapore, 119615, 65162093") with no verb at all, then settle. The
+    tuple must persist all four slots -- including the 6-start contact -- and the
+    checkout turn's SKU phrase ("1 x AM-EAR-1002 Nimbus Air 2") must never be
+    parsed and stored as the delivery address.
+    """
+    first = run_agentmart("I want to buy AM-EAR-1002.", dry_run=dry_run, channel="telegram")
+    draft_id = first.get("draft_order", {}).get("order_id")
+
+    second = run_agentmart(
+        "David Neo, 25 Heng Mui Keng Terrace Singapore, 119615, 65162093",
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    checkout = run_agentmart(
+        f"Checkout and pay for order {draft_id}.", dry_run=dry_run, channel="telegram"
+    )
+    receipt = checkout.get("payment_receipt", {})
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 1 left it unpaid", first.get("draft_order", {}).get("status") == "awaiting_payment"),
+        expect("the bare tuple routes to purchase_intent", second.get("intent") == "purchase_intent"),
+        expect("the bare tuple persisted all four slots", not second.get("missing_delivery_slots")),
+        expect("checkout targeted the same order", receipt.get("order_id") == draft_id),
+        expect("checkout captured the payment", receipt.get("status") == "captured"),
+        expect("payment flagged simulated", receipt.get("simulated") is True),
+    ]
+    if draft_id:
+        persisted = get_order(draft_id)
+        checks.append(
+            expect(
+                "the four tuple slots are on the order",
+                persisted.get("delivery_recipient") == "David Neo"
+                and persisted.get("delivery_address") == "25 Heng Mui Keng Terrace Singapore"
+                and persisted.get("delivery_postal") == "119615"
+                and persisted.get("delivery_contact") == "65162093",
+            )
+        )
+        checks.append(
+            expect(
+                "checkout did NOT overwrite the address with the SKU phrase",
+                persisted.get("delivery_address") == "25 Heng Mui Keng Terrace Singapore",
+            )
+        )
+        checks.append(expect("checkout marked the order paid", persisted["status"] == "paid"))
+
+    return checks, checkout
+
+
 def run_scenario(scenario: Scenario, dry_run: bool, verbose: bool) -> list[Check]:
     result = run_agentmart(
         scenario.request,
@@ -1023,7 +1114,7 @@ def main() -> int:
     run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify", "quote-correct-and-reupdate"}
+        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify", "quote-correct-and-reupdate", "bare-tuple-then-checkout"}
         unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -1098,6 +1189,12 @@ def main() -> int:
             run_quote_correct_and_reupdate,
             "Buy AM-EAR-1002 -> update -> lookup -> quoted correction.",
             "A quoted read-only result must not downgrade the corrective update.",
+        ),
+        (
+            "bare-tuple-then-checkout",
+            run_bare_tuple_then_checkout,
+            "Buy AM-EAR-1002 -> 'David Neo, 25 Heng Mui Keng Terrace Singapore, 119615, 65162093' -> checkout.",
+            "A verb-less delivery tuple persists all four slots; checkout must not store the SKU phrase as the address.",
         ),
     ]
     for name, fn, request, describes in chained:

@@ -309,6 +309,8 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
             r"[^.?]{0,120}\bdelivery\s+(?:details|address)\b|"
             r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
+            r"[^.?]{0,200}\bwith\s+details?\s*:|"
+            r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
             r"[^.?]{0,160}\b(?:these|those)\s+(?:exact\s+)?(?:missing\s+)?fields?\s*:",
             re.IGNORECASE,
         ),
@@ -416,6 +418,20 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"list\s+(me|the|all|available)|show\s+me|what\s+(do\s+you\s+have|is\s+available|"
             r"products?\s+are)|browse|catalog(ue)?|available\s+product",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # 5. A bare delivery tuple with no verb at all ("David Neo, 25 Heng Mui
+        # Keng Terrace Singapore, 119615, 65162093") is the customer supplying the
+        # slots, so record it on the draft. Kept last: every explicit checkout,
+        # status, draft, buy or browse marker above wins first, so a checkout
+        # request that also carries values is still a checkout.
+        "purchase_intent",
+        re.compile(
+            r"[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,2}\s*,\s*"
+            r"\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?\s*,\s*"
+            r"\d{6}\s*,\s*[2-9]\d{7}\b",
             re.IGNORECASE,
         ),
     ),
@@ -572,7 +588,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
     if positional:
         tokens = [t.strip().strip("'\" ") for t in positional.group(1).split(";") if t.strip()]
         postal = next((t for t in tokens if re.fullmatch(r"\d{6}", t)), "")
-        contact = next((t for t in tokens if re.fullmatch(r"[89]\d{7}", t)), "")
+        contact = next((t for t in tokens if re.fullmatch(r"[2-9]\d{7}", t)), "")
         address = next(
             (t for t in tokens if t not in (postal, contact) and re.search(r"\d", t) and len(t) > 3),
             "",
@@ -623,7 +639,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
                 match = re.search(r"([0-9]{6})", value)
                 value = match.group(1) if match else value
             elif slot == "contact":
-                match = re.search(r"([89][0-9]{7})", value)
+                match = re.search(r"([2-9][0-9]{7})", value)
                 value = match.group(1) if match else value
             elif slot == "recipient":
                 value = re.sub(r"^\s*(?:full\s+)?name\s*:\s*", "", value, flags=re.IGNORECASE).strip()
@@ -667,7 +683,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             value = re.sub(r"^\s*(?:full\s+)?name\s*:\s*", "", raw, flags=re.IGNORECASE).strip()
             details["recipient"] = value if value else raw
         elif slot == "contact":
-            match = re.search(r"([89][0-9]{7})", raw)
+            match = re.search(r"([2-9][0-9]{7})", raw)
             details[slot] = match.group(1) if match else raw
         elif slot == "postal":
             match = re.search(r"([0-9]{6})", raw)
@@ -693,6 +709,17 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             if not re.search(r"\d{1,6}\s+[A-Za-z]", value):
                 continue
             details[slot] = value
+            # A labelled "full delivery address 25 Heng Mui Keng Terrace,
+            # Singapore" truncates at the comma even though the area is part of
+            # the address. Re-attach a single capitalised area word that directly
+            # follows the captured line and is closed by a slot separator.
+            area = re.search(
+                rf"\b{re.escape(value)}\s*,\s*([A-Z][A-Za-z'-]+)\b([;,]|(?:\s+(?:postal|contact|recipient)\b)|$)",
+                text,
+                re.IGNORECASE,
+            )
+            if area and len(value) + len(area.group(1)) + 2 <= 48:
+                details["address"] = value + ", " + area.group(1)
         else:
             details[slot] = raw
 
@@ -707,7 +734,9 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         if match:
             details["recipient"] = match.group(1).strip().strip("'\" ") or details.get("recipient", "")
     if "contact" not in details:
-        match = re.search(r"\b([89][0-9]{7})\b", text)
+        # Singleton numbers in a bare request; never take a digit-run that is
+        # glued to an identifier ("AM-ORD-20260919-5E10" carries "-20260919").
+        match = re.search(r"(?<![\w-])([2-9][0-9]{7})(?![\w-])", text)
         if match:
             details["contact"] = match.group(1)
     if "postal" not in details:
@@ -731,8 +760,12 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         if match:
             details["recipient"] = match.group(1).strip()
     if "address" not in details:
+        # A house-numbered street line. The digits must start a fresh value: a
+        # SKU/quantity readback like "1 x AM-EAR-1002 Nimbus Air 2" embeds
+        # "1002" right after a hyphen, so "1002 Nimbus Air 2" must never be
+        # captured as an address.
         match = re.search(
-            r"\b(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|;|\s{2,}|$)",
+            r"(?<![\w-])(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|;|\s{2,}|$)",
             text,
             re.IGNORECASE,
         )
@@ -740,6 +773,23 @@ def extract_delivery_details(text: str) -> dict[str, str]:
             details["address"] = (
                 match.group(1).strip().strip("'\" ").strip()
             )
+
+    # A bare comma-separated ordered list in the order the Order Agent asks for
+    # the slots ("David Neo, 25 Heng Mui Keng Terrace Singapore, 119615,
+    # 65162093"). Fill anything the keyword passes above could not parse: the
+    # name and the 6-start contact number are the usual losses.
+    if not {"recipient", "address", "postal", "contact"}.issubset(details):
+        tuple_match = re.search(
+            r"([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,2})\s*,\s*"
+            r"(\d{1,6}\s+[A-Za-z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)\s*,\s*"
+            r"(\d{6})\s*,\s*([2-9]\d{7})\b",
+            text,
+        )
+        if tuple_match:
+            details.setdefault("recipient", tuple_match.group(1).strip())
+            details.setdefault("address", tuple_match.group(2).strip().strip("'\" ").strip())
+            details.setdefault("postal", tuple_match.group(3))
+            details.setdefault("contact", tuple_match.group(4))
 
     return details
 
