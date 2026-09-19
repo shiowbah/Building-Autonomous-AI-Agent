@@ -700,6 +700,13 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
     ("Update draft AM-ORD-20260919-5E3E with these delivery details exactly: full name: David "
      "Neo; full delivery address: 25 Heng Mui Keng Terrace Singapore; postal code: 119615; "
      "contact number: 65162093. Confirm whether the update was persisted.", "purchase_intent"),
+    # The A5ED live run verbatim: an address update asked to 'report whether the details
+    # were accepted' must route to drafting, never to payment or a read-only lookup.
+    ("Update the delivery details for AM-ORD-20260919-A5ED / SKU AM-EAR-1002 using exactly: "
+     "recipient full name David Neo; complete delivery address 25 Heng Mui Keng Terrace "
+     "Singapore; postal code 119615; contact number 65162093. Do not authorize payment, "
+     "capture funds, reserve inventory, or place/modify any other order. After updating, "
+     "report whether the details were accepted.", "purchase_intent"),
     # A retry that confirms a value at the start ("I confirm the recipient's full name is
     # exactly...") and then updates the existing draft "with recipient name ..." routed to
     # order_status (no rule matched -> order-id fallback) and never persisted. The trailing
@@ -1059,6 +1066,63 @@ def run_bare_tuple_then_checkout(dry_run: bool, verbose: bool) -> tuple[list[Che
     return checks, checkout
 
 
+def run_update_acknowledges_persistence(dry_run: bool, verbose: bool) -> tuple[list[Check], dict[str, Any]]:
+    """The live false-negative: an update lands, then is reported as failed.
+
+    The operator's A5ED run persisted all four delivery slots (the DB row and the
+    follow-up read-back both showed them) yet the Order Agent replied 'not updated
+    or accepted'. The order_agent state must expose exactly which slots this turn
+    wrote so the prompt instructs the model to confirm the acceptance -- and the
+    deterministic layer must never signal failure that contradicts the order book.
+    """
+    buy = run_agentmart("I want to buy AM-EAR-1002.", dry_run=dry_run, channel="telegram")
+    draft_id = buy.get("draft_order", {}).get("order_id")
+    oid = draft_id or "AM-ORD-TBD"
+
+    update = run_agentmart(
+        ("Update the delivery details for {0} / SKU AM-EAR-1002 using exactly: recipient "
+         "full name David Neo; complete delivery address 25 Heng Mui Keng Terrace Singapore; "
+         "postal code 119615; contact number 65162093. Do not authorize payment, capture "
+         "funds, reserve inventory, or place/modify any other order. After updating, report "
+         "whether the details were accepted.").format(oid),
+        dry_run=dry_run,
+        channel="telegram",
+    )
+
+    checks = [
+        expect("turn 1 created a draft order", bool(draft_id)),
+        expect("turn 1 left it unpaid", buy.get("draft_order", {}).get("status") == "awaiting_payment"),
+        expect("the update routes to drafting, not checkout_payment", update.get("intent") == "purchase_intent"),
+        expect(
+            "the turn reports exactly which slots were persisted",
+            sorted(update.get("delivery_updated_slots") or []) == ["address", "contact", "postal", "recipient"],
+        ),
+        expect("no delivery slot is outstanding after the update", not update.get("missing_delivery_slots")),
+        expect("the update did NOT run the payment agent", "payment_agent" not in agents_visited(update)),
+        expect("no payment receipt was produced", not update.get("payment_receipt")),
+    ]
+    if draft_id:
+        persisted = get_order(draft_id)
+        checks.append(
+            expect(
+                "the four slots are on the order, exactly as supplied",
+                persisted.get("delivery_recipient") == "David Neo"
+                and persisted.get("delivery_address") == "25 Heng Mui Keng Terrace Singapore"
+                and persisted.get("delivery_postal") == "119615"
+                and persisted.get("delivery_contact") == "65162093",
+            )
+        )
+        checks.append(
+            expect(
+                "the order book shows the update really landed (no failure)",
+                persisted.get("delivery_recipient") == "David Neo"
+                and persisted["status"] == "awaiting_payment",
+            )
+        )
+
+    return checks, update
+
+
 def run_scenario(scenario: Scenario, dry_run: bool, verbose: bool) -> list[Check]:
     result = run_agentmart(
         scenario.request,
@@ -1105,6 +1169,7 @@ def main() -> int:
         print(f"{'draft-refresh':<24} {'(chained)':<17} re-quote a draft: reused, never charged")
         print(f"{'draft-needs-fields':<24} {'(chained)':<17} partial delivery: ask, then complete the draft")
         print(f"{'update-then-verify':<24} {'(chained)':<17} update a draft, then verify it read-only")
+        print(f"{'update-acknowledges-persistence':<24} {'(chained)':<17} update persists; the turn must not report a failure")
         print(f"{'quote-correct-and-reupdate':<24} {'(chained)':<17} update -> lookup -> quoted correction")
         print(f"{'intent-routing':<24} {'(routing)':<17} phrasings, human and agent-generated")
         return 0
@@ -1114,7 +1179,7 @@ def main() -> int:
     run_chained: set[str] = set()
     if args.scenario:
         names = set(args.scenario)
-        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify", "quote-correct-and-reupdate", "bare-tuple-then-checkout"}
+        known_chained = {"buy-then-checkout", "draft-refresh", "draft-needs-fields", "update-then-verify", "update-acknowledges-persistence", "quote-correct-and-reupdate", "bare-tuple-then-checkout"}
         unknown = names - set(SCENARIOS_BY_NAME) - known_chained - {"intent-routing"}
         if unknown:
             print(f"Unknown scenario(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -1183,6 +1248,12 @@ def main() -> int:
             run_update_then_verify,
             "Buy AM-EAR-1002 -> update address -> verify (must not clobber).",
             "A read-back after an address update stays read-only.",
+        ),
+        (
+            "update-acknowledges-persistence",
+            run_update_acknowledges_persistence,
+            "Buy AM-EAR-1002 -> update delivery -> report whether accepted.",
+            "An update that persists must be reported as accepted, never as failed.",
         ),
         (
             "quote-correct-and-reupdate",

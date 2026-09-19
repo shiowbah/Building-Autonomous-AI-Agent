@@ -90,6 +90,7 @@ class AgentMartState(TypedDict, total=False):
     draft_order: dict[str, Any]
     payment_receipt: dict[str, Any]
     delivery_details: dict[str, str]
+    delivery_updated_slots: list[str]
     missing_delivery_slots: list[str]
     checkout_blocked_reason: str
     intent_only_recorded: bool
@@ -1142,7 +1143,31 @@ def message_for_drafted_purchase(state: AgentMartState) -> str:
     The ask for delivery details must read like a person, not like form labels:
     no bare "recipient / address / postal / contact" bullets. Name each missing
     slot in plain words inside a natural, friendly sentence.
+
+    When this turn just persisted delivery slots (an "update ... with exactly:"
+    or "report whether the details were accepted" request), the instruction must
+    state the outcome explicitly: the model once reported the update as failed
+    even though the slots had landed, because the guardrail-wording of the
+    peer's request ("do not authorize payment, capture funds, reserve
+    inventory") read like nothing had happened.
     """
+    if state.get("delivery_updated_slots"):
+        slots = state["delivery_updated_slots"]
+        saved_plain = ", ".join(
+            DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS if key in slots
+        )
+        draft_id = (state.get("draft_order") or {}).get("order_id")
+        confirm = (
+            f"The delivery details supplied in this turn HAVE been accepted and saved to "
+            f"draft {draft_id}: {saved_plain}. However the request is phrased -- even when "
+            f"it forbids charging, reserving, or placing an order -- these slots were "
+            f"persisted and this is a fact of the order book. State clearly and warmly that "
+            f"the update was accepted and stored; NEVER claim the update failed, was not "
+            f"accepted, could not be processed, or was not persisted. If the customer asked "
+            f"whether the details were accepted, answer that they were."
+        )
+    else:
+        confirm = ""
     missing = state.get("missing_delivery_slots") or []
     if missing:
         plain_labels = [
@@ -1177,12 +1202,13 @@ def message_for_drafted_purchase(state: AgentMartState) -> str:
             "the customer to confirm so the payment can go through. Nothing is charged "
             "until they confirm. Do not ask for delivery details again."
         )
+    lead = confirm + (" " if confirm else "")
     if not intent_only_request(state.get("customer_request") or ""):
-        return ask + (
+        return lead + ask + (
             " The original customer_request is authoritative: report the draft and ask "
             "for any missing delivery details conversationally."
         )
-    return ask + (
+    return lead + ask + (
         " IMPORTANT: peer_requested_intent_only is true. The requesting peer wrapped the "
         "purchase in guardrail language ('record purchase intent only', 'do not create or "
         "modify an order', 'confirm only that the intent was recorded'). That is the peer "
@@ -1317,12 +1343,15 @@ def _persist_delivery_details(
     state: AgentMartState,
     draft: dict[str, Any],
     customer_id: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[str]]:
     """Extract delivery slots from the incoming request and persist them.
 
-    Returns the refreshed draft. Anything the customer supplied is written even
-    if slots are still missing; the caller records what is outstanding so the
-    prompt can tell the Order Agent to ask for it.
+    Returns ``(refreshed_draft, slots_written)``. Anything the customer supplied
+    is written even if slots are still missing; the caller records what is
+    outstanding so the prompt can tell the Order Agent to ask for it. ``slots_written``
+    names the slots this turn actually persisted, empty when nothing was supplied or
+    the write failed -- the prompt needs it so an update is never reported as failed
+    when it in fact landed.
     """
     request_text = state.get("customer_request") or ""
     if not request_text:
@@ -1330,12 +1359,13 @@ def _persist_delivery_details(
         request_text = (task.get("payload") or {}).get("customer_request") or ""
     provided = extract_delivery_details(request_text)
     if not provided:
-        return draft
+        return draft, []
     try:
-        return update_draft_delivery(draft["order_id"], provided, db_path=None)
+        refreshed = update_draft_delivery(draft["order_id"], provided, db_path=None)
+        return refreshed, [key for key in REQUIRED_DELIVERY_SLOTS if provided.get(key)]
     except Exception as exc:  # never fail the hop because a slot could not be written
         log.error("order_agent: delivery persist failed for %s: %s", draft["order_id"], exc)
-        return draft
+        return draft, []
 
 
 def order_agent_node(state: AgentMartState) -> AgentMartState:
@@ -1409,7 +1439,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                 log.error("order_agent: draft failed for sku=%s: %s", sku, exc)
 
         if draft:
-                draft = _persist_delivery_details(
+                draft, updated_slots = _persist_delivery_details(
                     state, draft, customer_id=customer_id
                 )
                 next_state["draft_order"] = draft
@@ -1424,6 +1454,8 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                     key for key in REQUIRED_DELIVERY_SLOTS
                     if not (draft.get(f"delivery_{key}") or "").strip()
                 ]
+                if updated_slots:
+                    next_state["delivery_updated_slots"] = updated_slots
                 log.info(
                     "order_agent: draft %s delivery_see=%s missing=%s",
                     draft["order_id"],
@@ -1473,7 +1505,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
             if target:
                 # The checkout turn itself may carry the missing delivery slots;
                 # persist them before deciding whether settlement may proceed.
-                updated = _persist_delivery_details(
+                updated, _ = _persist_delivery_details(
                     state, target, customer_id=customer_id
                 )
                 if updated:
@@ -1531,7 +1563,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     # Only the keys this node actually decided; transcript/a2a_log go back as deltas.
     delta: AgentMartState = {
         k: v for k, v in next_state.items()
-        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots", "checkout_blocked_reason", "intent_only_recorded")
+        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "delivery_updated_slots", "missing_delivery_slots", "checkout_blocked_reason", "intent_only_recorded")
     }
     delta["transcript"] = [transcript_entry("order_agent", result, envelope)]
     delta["a2a_log"] = [envelope, done]
