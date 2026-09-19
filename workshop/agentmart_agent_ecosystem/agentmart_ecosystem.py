@@ -92,6 +92,7 @@ class AgentMartState(TypedDict, total=False):
     delivery_details: dict[str, str]
     missing_delivery_slots: list[str]
     checkout_blocked_reason: str
+    intent_only_recorded: bool
     transcript: Annotated[list[dict[str, Any]], operator.add]
 
 
@@ -295,7 +296,23 @@ ORDER_ID_PATTERN = re.compile(r"\bAM-ORD-[\w-]+\b", re.IGNORECASE)
 # ("has my payment gone through?") must stay a status lookup and never charge.
 INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
-        # 0. An explicit request to *draft* an order outranks every payment word
+        # 0. Read-only/verification phrasings never settle anything. Remote peers
+        # state their own guardrails inline ("Read-only verification only"), so the
+        # markers here mean "lookup", not "charge". A real checkout that happens to
+        # verify the cart first is NOT matched (no read-only marker in it), so it
+        # still lands on the payment path.
+        "order_status",
+        re.compile(
+            r"read[\s-]?only\b|"
+            r"verif\w*\s+only\b|"
+            r"\breconcil(?:iation|ing)?\b|"
+            r"\baudit\b|"
+            r"confirm\s+(?:whether|if)\s+no\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # 1. An explicit request to *draft* an order outranks every payment word
         # that may trail it ("...just confirm the draft and the next checkout step").
         # The verb list and middle are deliberately loose: remote agents say "create
         # a payable checkout draft", "prepare a checkout draft", "make an order
@@ -314,7 +331,7 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        # 1. Unambiguous checkout imperatives. "checkout draft" is a noun phrase,
+        # 2. Unambiguous checkout imperatives. "checkout draft" is a noun phrase,
         # never a settle-and-pay instruction.
         "checkout_payment",
         re.compile(
@@ -324,7 +341,7 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        # 2. Status questions, including questions *about* a payment.
+        # 3. Status questions, including questions *about* a payment.
         "order_status",
         re.compile(
             r"order\s+status|order\s+summary|order[_\s]status[_\s]lookup|"
@@ -335,7 +352,7 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        # 3. Weaker payment wording, only once a status reading is ruled out.
+        # 4. Weaker payment wording, only once a status reading is ruled out.
         "checkout_payment",
         re.compile(r"\bpay\b|\bpaying\b|payment", re.IGNORECASE),
     ),
@@ -372,6 +389,76 @@ PROHIBITION_CLAUSE = re.compile(
 def strip_prohibitions(text: str) -> str:
     """Remove negated clauses so a forbidden action cannot be read as a requested one."""
     return PROHIBITION_CLAUSE.sub(" ", text)
+
+
+# Read-only markers. The Payment Agent treats any request with one of these as a
+# lookup, never a charge, even if the request happens to mention a payment id.
+READ_ONLY_MARKER = re.compile(
+    r"read[\s-]?only\b|"
+    r"verif\w*\s+only\b|"
+    r"\breconcil(?:iation|ing)?\b|"
+    r"\baudit\b|"
+    r"confirm\s+(?:whether|if)\s+no\b",
+    re.IGNORECASE,
+)
+
+# What a genuine settle-and-pay request actually says. "prepare/update a checkout
+# draft" is cared for by routing and must never satisfy this test.
+PAYMENT_IMPERATIVE = re.compile(
+    r"check\s?-?\s?out\b(?!\s*(?:draft|step|summary|details|flow|process|page|"
+    r"link|option|review|confirmation|required|below))\b|"
+    r"\bproceed(?:ing)?\s+with\s+checkout\b|"
+    r"\bpay\s+(?:now|for|the\s+order|this|it|my\s+order)\b|"
+    r"\bplace\s+the\s+order\b|"
+    r"\bsettle\b|"
+    r"\bsubmit\s+(?:the\s+)?(?:payment|charge)\b",
+    re.IGNORECASE,
+)
+
+# A request that records a purchase intent WITHOUT drafting. "Record the purchase
+# intent and prepare a checkout draft" is the opposite and must not match.
+INTENT_ONLY_RECORD = re.compile(
+    r"\bpurchase\s+intent\s+only\b|"
+    r"record\w*\s+(?:this|the)\s+.{0,20}\bintent\b|"
+    r"record(?:ing)?\s+.*\bintent\b.{0,40}\bonly\b",
+    re.IGNORECASE,
+)
+INTENT_ONLY_BLOCK = re.compile(
+    r"(?:do\s+not|do\s?n['\u2019]t|never|without|avoid)\b[^.;:\n]{0,60}"
+    r"\b(?:create|open|place|make|modify|reserve|touch)\b[^.;:\n]{0,50}\border\b|"
+    r"\b(?:order\s+book|any\s+order|prior\s+order)\b.{0,40}\b(?:do\s+not|never|without)\b",
+    re.IGNORECASE,
+)
+INTENT_ONLY_DRAFT = re.compile(
+    r"(?:create|prepare|make|write|set\s*up|update|refresh)\b[^.]{0,80}\bdraft\b",
+    re.IGNORECASE,
+)
+
+
+def is_read_only_request(text: str) -> bool:
+    """True when the request is a verification/lookup, never an action."""
+    return bool(READ_ONLY_MARKER.search(text or ""))
+
+
+def _explicit_payment_imperative(text: str) -> bool:
+    """True when the request really asks to settle. Guardrails are dropped so that
+    'do not pay' cannot satisfy the pay imperative."""
+    return bool(PAYMENT_IMPERATIVE.search(strip_prohibitions(text or "")))
+
+
+def intent_only_request(text: str) -> bool:
+    """True when the peer wants intent recorded but explicitly NOT an order.
+
+    Requires all three: an intent-only phrasing, a prohibition on creating/modifying
+    an order, and no draft-creation request. 'Record the purchase intent and prepare
+    a checkout draft' fails the last test and still drafts.
+    """
+    text = text or ""
+    return bool(
+        INTENT_ONLY_RECORD.search(text)
+        and INTENT_ONLY_BLOCK.search(text)
+        and not INTENT_ONLY_DRAFT.search(text)
+    )
 
 
 def classify_intent(customer_request: str) -> Intent:
@@ -476,6 +563,31 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         match = re.search(r"\b([0-9]{6})\b", text)
         if match:
             details["postal"] = match.group(1)
+
+    # Peers sometimes skip the slot labels entirely and just give an ordered list
+    # ("Use delivery details: Ang Chin Tiong, 3 Pine Grove, Singapore 597590,
+    # contact number 97492736"). Fall back to positional/structural patterns:
+    # the recipient is whatever leads the "delivery details:" list, and the
+    # address is the first house-numbered line in the request.
+    if "recipient" not in details:
+        match = re.search(
+            r"delivery\s+details?\s*:\s*"
+            r"(?!(?:postal|address|contact|phone|recipient|name|code)\b)"
+            r"([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,2})",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            details["recipient"] = match.group(1).strip()
+    if "address" not in details:
+        match = re.search(
+            r"\b(\d{1,6}\s+[A-Z][A-Za-z]{3,}(?:[ -][A-Za-z0-9']+)*?)(?:,|\s{2,}|$)",
+            text,
+        )
+        if match:
+            details["address"] = (
+                match.group(1).strip().strip("'\" ").strip()
+            )
 
     return details
 
@@ -792,6 +904,91 @@ ORDER_AGENT_SYSTEM_PROMPT = (
 )
 
 
+def self_consistent_a2a_task(state: AgentMartState) -> dict[str, Any]:
+    """Hand the Order Agent a copy of the A2A envelope whose request is unambiguous.
+
+    A peer that says "record this as purchase intent only... do not create or modify
+    an order... confirm only that the intent was recorded" is using guardrail phrasing
+    even though it named a SKU -- i.e. it wants to buy. The Order Agent has already
+    materialised the draft. If the raw wrapper text reached the model as the operative
+    instruction it would make the reply claim nothing was created, so replace it with a
+    factual statement once a draft exists.
+    """
+    task = state.get("a2a_task") or {}
+    if not (state.get("draft_order") or {}).get("order_id"):
+        return {"a2a_task": task}
+    if not intent_only_request(state.get("customer_request") or ""):
+        return {"a2a_task": task}
+    draft_id = state["draft_order"]["order_id"]
+    clean = json.loads(json.dumps(task))
+    payload = clean.get("payload") or {}
+    payload["customer_request"] = (
+        f"The customer asked to buy 1 x {state.get('target_sku') or 'the item in the draft'}. "
+        f"Draft order {draft_id} has been prepared and is awaiting payment. Any "
+        f"'record intent only / do not create an order' wording in the peer's message is "
+        f"guardrail phrasing, not the actual outcome."
+    )
+    return {"a2a_task": clean}
+
+
+def message_for_drafted_purchase(state: AgentMartState) -> str:
+    """The Order Agent instruction once a draft order is on the books.
+
+    The ask for delivery details must read like a person, not like form labels:
+    no bare "recipient / address / postal / contact" bullets. Name each missing
+    slot in plain words inside a natural, friendly sentence.
+    """
+    missing = state.get("missing_delivery_slots") or []
+    if missing:
+        plain_labels = [
+            DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS
+        ]
+        missing_plain = ", ".join(
+            DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS if key in missing
+        )
+        given = ", ".join(
+            DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS if key not in missing
+        ) or "none yet"
+        ask = (
+            "Keep the draft summary short (two or three lines): item and quantity, "
+            "total, fulfillment path, and that nothing is charged until the customer "
+            "confirms checkout.\n"
+            f"No payment is charged yet, but the draft cannot be finalised without "
+            f"delivery details. What the customer has already given: {given}. Still "
+            f"needed: {missing_plain}.\n"
+            "End the reply by ASKING for the still-missing delivery details in one warm, "
+            "natural sentence or two, addressed to the customer in the first person -- for "
+            "example: 'Could you share your full name, delivery address, postal code, and "
+            "contact number so I can finalise your order? Nothing will be charged until "
+            "you confirm.' Name every still-missing slot in plain words (use the labels "
+            "above), and never list them as bare form labels such as recipient/address/"
+            "postal/contact or say 'please provide exactly'."
+        )
+    else:
+        ask = (
+            "The draft has complete delivery details and is ready for the customer to "
+            "confirm checkout. Keep the reply short (two or three lines): item and "
+            "quantity, total, delivery path, and a friendly first-person line inviting "
+            "the customer to confirm so the payment can go through. Nothing is charged "
+            "until they confirm. Do not ask for delivery details again."
+        )
+    if not intent_only_request(state.get("customer_request") or ""):
+        return ask + (
+            " The original customer_request is authoritative: report the draft and ask "
+            "for any missing delivery details conversationally."
+        )
+    return ask + (
+        " IMPORTANT: peer_requested_intent_only is true. The requesting peer wrapped the "
+        "purchase in guardrail language ('record purchase intent only', 'do not create or "
+        "modify an order', 'confirm only that the intent was recorded'). That is the peer "
+        "being cautious, NOT a statement of fact: the draft order WAS created and is "
+        "awaiting payment. Ignore that wrapper completely in your reply. NEVER claim no "
+        "order was created, modified, or charged, and never claim only the intent was "
+        "recorded. Report the draft order id, its contents and total, and ask for any "
+        "missing delivery details conversationally."
+    )
+
+
 def _order_agent_prompt(state: AgentMartState) -> str:
     intent = state.get("intent", "product_advice")
     common = {
@@ -821,28 +1018,35 @@ def _order_agent_prompt(state: AgentMartState) -> str:
         )
 
     if intent == "purchase_intent":
+        if state.get("intent_only_recorded"):
+            return json.dumps(
+                {
+                    **common,
+                    "intent_only_recorded": True,
+                    "instruction": (
+                        "The customer asked to RECORD the purchase intent only, and "
+                        "explicitly forbade creating or modifying an order, reserving "
+                        "stock, or taking any payment action. No order was created, "
+                        "modified, or charged. Confirm the product and quantity named in "
+                        "the request (use the original customer_request), state plainly "
+                        "that no order was created and no payment was made, and do not "
+                        "present any draft, total, or checkout step."
+                    ),
+                },
+                indent=2,
+            )
         return json.dumps(
             {
                 **common,
+                **self_consistent_a2a_task(state),
                 "draft_order": state.get("draft_order", {}),
                 "delivery_details": state.get("delivery_details", {}),
                 "missing_delivery_slots": state.get("missing_delivery_slots", []),
+                "peer_requested_intent_only": intent_only_request(state.get("customer_request") or ""),
                 "inventory_result": state.get("inventory_result", "(agent not on this path)"),
                 "fulfillment_result": state.get("fulfillment_result", "(agent not on this path)"),
                 "instruction": (
-                    "A draft order has been created and is awaiting payment. Confirm back to the "
-                    "customer what is reserved, the line items, the total, and the delivery path. "
-                    "State clearly that nothing is charged until they confirm checkout.\n"
-                    "Delivery details are REQUIRED before checkout: "
-                    + ", ".join(
-                        DELIVERY_SLOT_LABELS[key] for key in REQUIRED_DELIVERY_SLOTS
-                    )
-                    + ".\n"
-                    "The slots the customer has already given are listed in delivery_details; "
-                    "the slots still missing are listed in missing_delivery_slots. "
-                    "If any required slot is missing, clearly ASK the customer for exactly the "
-                    "missing ones (use the labels above) and do NOT present the draft as a "
-                    "confirmed order ready to pay until every slot is present. Say what is missing."
+                    message_for_drafted_purchase(state)
                 ),
             },
             indent=2,
@@ -931,10 +1135,18 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     next_state: AgentMartState = {**state}
 
     # A purchase intent materialises a real draft order before the model speaks.
+    # The one exception is a request that ONLY records intent and names no
+    # product at all: there is nothing to draft yet. A named SKU is an express
+    # wish to buy, so even a guardrail-y "record purchase intent only, do not
+    # create an order" wrapper must still yield the draft and ask for delivery
+    # details -- otherwise the customer can never get to checkout.
     if intent == "purchase_intent":
         sku = state.get("target_sku")
-        draft = None
-        if not sku:
+        draft: dict[str, Any] | None = None
+        if not sku and intent_only_request(state.get("customer_request") or ""):
+            log.info("order_agent: intent-only request with no SKU - order book left untouched")
+            next_state["intent_only_recorded"] = True
+        elif not sku:
             open_drafts = sorted(
                 (
                     order for order in list_orders(customer_id=customer_id)
@@ -977,40 +1189,60 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
                 log.error("order_agent: draft failed for sku=%s: %s", sku, exc)
 
         if draft:
-            draft = _persist_delivery_details(
-                state, draft, customer_id=customer_id
-            )
-            next_state["draft_order"] = draft
-            next_state["target_order_id"] = draft["order_id"]
-            next_state["order_context"] = format_order(draft)
-            next_state["delivery_details"] = {
-                key: draft.get(f"delivery_{key}")
-                for key in REQUIRED_DELIVERY_SLOTS
-                if draft.get(f"delivery_{key}")
-            }
-            next_state["missing_delivery_slots"] = [
-                key for key in REQUIRED_DELIVERY_SLOTS
-                if not (draft.get(f"delivery_{key}") or "").strip()
-            ]
-            log.info(
-                "order_agent: draft %s delivery_see=%s missing=%s",
-                draft["order_id"],
-                ",".join(next_state["delivery_details"]) or "-",
-                ",".join(next_state["missing_delivery_slots"]) or "-",
-            )
+                draft = _persist_delivery_details(
+                    state, draft, customer_id=customer_id
+                )
+                next_state["draft_order"] = draft
+                next_state["target_order_id"] = draft["order_id"]
+                next_state["order_context"] = format_order(draft)
+                next_state["delivery_details"] = {
+                    key: draft.get(f"delivery_{key}")
+                    for key in REQUIRED_DELIVERY_SLOTS
+                    if draft.get(f"delivery_{key}")
+                }
+                next_state["missing_delivery_slots"] = [
+                    key for key in REQUIRED_DELIVERY_SLOTS
+                    if not (draft.get(f"delivery_{key}") or "").strip()
+                ]
+                log.info(
+                    "order_agent: draft %s delivery_see=%s missing=%s",
+                    draft["order_id"],
+                    ",".join(next_state["delivery_details"]) or "-",
+                    ",".join(next_state["missing_delivery_slots"]) or "-",
+                )
 
-    # A bare "checkout and pay" resolves to the customer's newest open draft,
-    # then delivery completeness gates whether the Payment Agent may run.
+    # A bare "checkout and pay" resolves to the newest open draft (or, when a
+    # SKU is named, the newest open draft FOR that SKU -- creating one if the
+    # purchase intent never materialised), then delivery completeness gates
+    # whether the Payment Agent may run.
     if intent == "checkout_payment":
         target_id = next_state.get("target_order_id")
         if not target_id:
+            sku = state.get("target_sku")
             try:
-                payable = find_payable_order(customer_id)
-                if payable:
-                    next_state["target_order_id"] = payable["order_id"]
-                    target_id = payable["order_id"]
-                    next_state["order_context"] = format_order(payable)
-            except OrderBookNotSeededError as exc:
+                if sku:
+                    draft = find_open_draft(customer_id, sku)
+                    if not draft:
+                        draft = create_draft_order(
+                            customer_id=customer_id,
+                            items=[{"sku": sku, "quantity": 1}],
+                            warehouse="SG-CENTRAL",
+                            fulfillment_method="standard_delivery",
+                        )
+                        log.info(
+                            "order_agent: drafted %s for sku=%s during checkout (customer=%s)",
+                            draft["order_id"], sku, customer_id,
+                        )
+                    target_id = draft["order_id"]
+                    next_state["target_order_id"] = target_id
+                    next_state["order_context"] = format_order(draft)
+                else:
+                    payable = find_payable_order(customer_id)
+                    if payable:
+                        target_id = payable["order_id"]
+                        next_state["target_order_id"] = target_id
+                        next_state["order_context"] = format_order(payable)
+            except (CatalogNotSeededError, OrderBookNotSeededError, ValueError) as exc:
                 next_state["order_context"] = f"(order book unavailable: {exc})"
 
         if target_id:
@@ -1019,6 +1251,13 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
             except OrderNotFoundError:
                 target = None
             if target:
+                # The checkout turn itself may carry the missing delivery slots;
+                # persist them before deciding whether settlement may proceed.
+                updated = _persist_delivery_details(
+                    state, target, customer_id=customer_id
+                )
+                if updated:
+                    target = updated
                 next_state["order_context"] = format_order(target)
                 provided = {
                     key: target.get(f"delivery_{key}")
@@ -1072,7 +1311,7 @@ def order_agent_node(state: AgentMartState) -> AgentMartState:
     # Only the keys this node actually decided; transcript/a2a_log go back as deltas.
     delta: AgentMartState = {
         k: v for k, v in next_state.items()
-        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots", "checkout_blocked_reason")
+        if k in ("draft_order", "target_order_id", "order_context", "delivery_details", "missing_delivery_slots", "checkout_blocked_reason", "intent_only_recorded")
     }
     delta["transcript"] = [transcript_entry("order_agent", result, envelope)]
     delta["a2a_log"] = [envelope, done]
@@ -1088,13 +1327,22 @@ PAYMENT_AGENT_SYSTEM_PROMPT = (
     "If the receipt has status 'blocked', NO payment was made: no authorization, no "
     "capture, nothing. Report the blocking reason from the receipt and the missing "
     "delivery details the customer still owes, and say there is no charge yet. Never "
-    "describe a blocked receipt as a completed or simulated payment."
+    "describe a blocked receipt as a completed or simulated payment.\n"
+    "If the receipt has status 'readonly_no_charge', NO payment was attempted either: "
+    "the request was a read-only verification or lookup, so the receipt simply reports "
+    "the order's current state from the order_book. Say plainly that nothing was "
+    "charged, captured, or authorized."
 )
+
+
+def _payment_request_text(state: AgentMartState) -> str:
+    return (state.get("customer_request") or "").strip()
 
 
 def payment_agent_node(state: AgentMartState) -> AgentMartState:
     """Payment Agent. Authorizes and captures a SIMULATED payment, then reports back."""
     order_id = state.get("target_order_id")
+    request_text = _payment_request_text(state)
 
     envelope = emit_envelope(
         state,
@@ -1110,6 +1358,29 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
     if not order_id:
         receipt = {"error": "no payable order found for this customer"}
         log.warning("payment_agent: checkout_payment with no target_order_id")
+    elif is_read_only_request(request_text) or not _explicit_payment_imperative(request_text):
+        # Defense in depth: routing sends read-only/verification phrasings to the
+        # Order Agent, but if one still reaches this node it must NEVER charge.
+        receipt = {
+            "status": "readonly_no_charge",
+            "order_id": order_id,
+            "reason": (
+                "the request did not clearly instruct payment; it read as "
+                "read-only verification or a status lookup. Nothing was charged."
+            ),
+            "order_status": None,
+            "simulated": True,
+        }
+        try:
+            lookup = get_order(order_id)
+            if lookup:
+                receipt["order_status"] = lookup["status"]
+        except Exception:  # noqa: BLE001 - a lookup failure must not turn into a charge
+            receipt["order_status"] = "unknown"
+        log.info(
+            "payment_agent: refused to settle %s — read-only / no explicit payment instruction",
+            order_id,
+        )
     elif state.get("checkout_blocked_reason"):
         receipt = {
             "status": "blocked",
@@ -1156,7 +1427,14 @@ def payment_agent_node(state: AgentMartState) -> AgentMartState:
     result = client.complete(
         "payment_agent",
         PAYMENT_AGENT_SYSTEM_PROMPT,
-        json.dumps({"a2a_task": state["a2a_task"], "receipt": receipt}, indent=2),
+        json.dumps(
+            {
+                "a2a_task": state["a2a_task"],
+                "receipt": receipt,
+                "order_book": state.get("order_context", ""),
+            },
+            indent=2,
+        ),
     )
     log.info(
         "payment_agent: completed in %.2fs (%d chars) | %s",

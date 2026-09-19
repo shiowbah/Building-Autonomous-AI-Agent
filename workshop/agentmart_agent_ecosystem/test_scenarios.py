@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from agentmart_ecosystem import INTENT_PATHS, classify_intent, run_agentmart
+from agentmart_ecosystem import INTENT_PATHS, classify_intent, extract_delivery_details, run_agentmart
 from orders import get_order, list_orders
 from seed_data import seed
 
@@ -191,6 +191,56 @@ def check_checkout(result: dict[str, Any]) -> list[Check]:
     return checks
 
 
+def check_read_only_verify(result: dict[str, Any]) -> list[Check]:
+    return [
+        expect("payment agent was NOT woken", "payment_agent" not in agents_visited(result)),
+        expect("no payment receipt was produced", not result.get("payment_receipt")),
+        expect("the named order is in the Order Agent's context", "AM-ORD-20260915-0003" in result.get("order_context", "")),
+        expect("nothing was charged (order untouched)", bool(result.get("order_context"))),
+    ]
+
+
+def check_buy_intent_drafts(result: dict[str, Any]) -> list[Check]:
+    return [
+        expect("a draft order materialised for the named SKU", bool(result.get("draft_order") and result.get("draft_order", {}).get("order_id"))),
+        expect("the draft targets the named product", "AM-EAR-1002" in result.get("order_context", "")),
+        expect("delivery details were asked for", bool(result.get("missing_delivery_slots"))),
+        expect("payment agent was NOT woken", "payment_agent" not in agents_visited(result)),
+        expect("no payment receipt was produced", not result.get("payment_receipt")),
+        expect("nothing was charged", result.get("amount_paid", 0) == 0),
+    ]
+
+
+def check_checkout_inline_delivery(result: dict[str, Any]) -> list[Check]:
+    """A checkout turn carrying unlabelled delivery details settles the right order."""
+    receipt = result.get("payment_receipt", {})
+    checks = [
+        expect("routes through the payment agent", "payment_agent" in agents_visited(result)),
+        expect("the target order contains the named SKU", "AM-EAR-1002" in result.get("order_context", "")),
+        expect("no delivery slot was left missing", not result.get("missing_delivery_slots")),
+        expect("payment was captured", receipt.get("status") == "captured"),
+        expect("no charge was blocked", not result.get("checkout_blocked_reason")),
+    ]
+    if receipt.get("order_id"):
+        checks.append(expect("receipt order == target order", receipt.get("order_id") == result.get("target_order_id")))
+        try:
+            persisted = get_order(receipt["order_id"])
+            checks.append(expect("delivery persisted from the inline message", persisted.get("delivery_recipient") == "Ang Chin Tiong"
+                           and persisted.get("delivery_address") == "3 Pine Grove"))
+        except Exception:  # noqa: BLE001 - the failed expectation is reported below
+            checks.append(expect("order row was readable", False))
+    return checks
+
+
+def check_intent_only(result: dict[str, Any]) -> list[Check]:
+    return [
+        expect("no draft order materialised", not result.get("draft_order")),
+        expect("intent-only flag set for the Order Agent prompt", result.get("intent_only_recorded") is True),
+        expect("payment agent was NOT woken", "payment_agent" not in agents_visited(result)),
+        expect("no payment receipt was produced", not result.get("payment_receipt")),
+    ]
+
+
 def check_full_advice_path(result: dict[str, Any]) -> list[Check]:
     return [
         expect("all five AgentMart agents ran", len(agents_visited(result)) == 6),
@@ -245,6 +295,67 @@ SCENARIOS: list[Scenario] = [
         channel="telegram",
         describes="A bare checkout is refused until the target order has complete delivery details.",
         checks=[lambda r: check_path(r, "checkout_payment"), check_checkout_blocks_missing_delivery, check_a2a_chain],
+    ),
+    Scenario(
+        name="read-only-verify",
+        request=(
+            "Read-only verification only; do not modify, cancel, refund, pay, or create anything. "
+            "Verify whether order AM-ORD-20260915-0003 contains AM-EAR-1002 (Nimbus Air 2), and "
+            "report its canonical item(s), status, amount, and whether the reported simulated "
+            "payment was real."
+        ),
+        intent="order_status",
+        describes="A read-only verification is a lookup: it must wake only the Order Agent and never charge.",
+        checks=[lambda r: check_path(r, "order_status"), check_read_only_verify, check_no_error_text],
+    ),
+    Scenario(
+        name="buy-intent-record",
+        request=(
+            "Tell AgentMart: the user wants to buy AM-EAR-1002 (Nimbus Air 2), quantity 1. "
+            "Record this as purchase intent only. Do not create or modify an order, reserve stock, "
+            "authorize payment, capture funds, or use any prior order. Confirm only that the intent "
+            "was recorded."
+        ),
+        intent="purchase_intent",
+        describes=(
+            "Even a guardrail-y 'record intent only, do not create an order' wrapper still names a "
+            "SKU: the customer wants to buy, so a real draft must materialise and delivery details "
+            "must be asked for -- no payment, no reservation."
+        ),
+        checks=[lambda r: check_path(r, "purchase_intent"), check_buy_intent_drafts, check_no_error_text],
+    ),
+    Scenario(
+        name="intent-only-no-sku",
+        request=(
+            "Record this as purchase intent only: the customer wants to buy a laptop but "
+            "has not chosen a specific model yet. Do not create or modify an order, reserve "
+            "stock, authorize payment, capture funds, or use any prior order. Confirm only "
+            "that the intent was recorded."
+        ),
+        intent="purchase_intent",
+        describes=(
+            "Without a concrete SKU there is nothing to draft: a pure intent-only request must "
+            "leave the order book untouched and never charge."
+        ),
+        checks=[lambda r: check_path(r, "purchase_intent"), check_intent_only, check_no_error_text],
+    ),
+    Scenario(
+        name="checkout-with-delivery-inline",
+        request=(
+            "Checkout and pay for exactly 1 \u00d7 Nimbus Air 2 (SKU AM-EAR-1002), using the "
+            "current purchase intent. Use delivery details: Ang Chin Tiong, 3 Pine Grove, "
+            "Singapore 597590, contact number 97492736, standard delivery. Verify the cart "
+            "contains only AM-EAR-1002 and report the final total and order ID. If required "
+            "delivery or payment details are unavailable, stop without charging. Do not use or "
+            "modify any other order."
+        ),
+        intent="checkout_payment",
+        describes=(
+            "Hermes sends the delivery slots inline and unlabelled ('Use delivery details: "
+            "Ang Chin Tiong, 3 Pine Grove, Singapore 597590, contact number 97492736'). The "
+            "checkout turn must persist them onto the Nimbus draft and settle it."
+        ),
+        checks=[lambda r: check_path(r, "checkout_payment"), check_checkout_inline_delivery, check_no_error_text],
     ),
     Scenario(
         name="product-advice",
@@ -488,6 +599,47 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
     # "where to buy" is advice; "wants to buy" is intent.
     ("Find wireless earbuds under $120 and include a link or where to buy.", "product_advice"),
     ("The customer wants to buy SKU AM-EAR-1002 (Nimbus Air 2).", "purchase_intent"),
+    # Read-only verification / reconciliation / audit phrasings are LOOKUPS. They
+    # mention payment ids and orders but must never wake the Payment Agent.
+    ("Read-only verification only; do not modify, cancel, refund, pay, or create anything. "
+     "Verify whether order AM-ORD-20260915-0003 contains AM-EAR-1002 (Nimbus Air 2), and "
+     "report its canonical item(s), status, amount, and whether the reported simulated "
+     "payment was real.", "order_status"),
+    ("Read-only order-status lookup: check the user's current order status, especially order "
+     "AM-ORD-20260915-0003 from the previous Nimbus Air 2 checkout. Do not create, modify, "
+     "cancel, refund, or place any order.", "order_status"),
+    ("Read-only reconciliation for order AM-ORD-20260915-0003: the prior lookup returned "
+     "payment ID PAY-20260918-B085, while an earlier lookup returned PAY-20260918-E10D. "
+     "Verify the single canonical order record and report the current order status. Do not "
+     "create, modify, cancel, refund, or place anything.", "order_status"),
+    ("Read-only verification only. Do not modify, pay, cancel, refund, or create anything. "
+     "Verify whether the updated draft AM-ORD-20260918-2AC7 contains the user-provided "
+     "address and Nimbus Air 2, and report its canonical status. Also verify whether the "
+     "newly reported order AM-ORD-20260915-0003 / payment PAY-20260918-AA8D is a real "
+     "external charge or only a simulated local record.", "order_status"),
+    ("Read-only verification for order AM-ORD-20260915-0003: item SKU(s), amount, "
+     "fulfillment, and whether it is the requested AM-EAR-1002. Do not modify, cancel, "
+     "refund, pay, or create anything.", "order_status"),
+    # A GLOBAL CHECKOUT that verifies the cart before paying is still a checkout and
+    # must keep charging (the verification-only rule must not hijack it).
+    ("Checkout and pay for exactly 1 x Nimbus Air 2 (SKU AM-EAR-1002) for customer "
+     "CUST-1001, using the provided delivery details: 3 Pine Grove, Singapore 597590; "
+     "recipient Ang Chin Tiong; contact number 97492736; standard delivery. Before payment, "
+     "verify the cart contains only this SKU and return the final item price, shipping, "
+     "taxes/fees, total, and payment method identifier. Do not substitute items.", "checkout_payment"),
+    # Recording intent only, with an express ban on creating orders, still routes to
+    # purchase_intent; the Order Agent then decides draft/no-draft from whether a SKU
+    # is named (a named SKU means the customer wants to buy, so it drafts and asks
+    # for delivery; only a SKU-less intent stays purely recorded).
+    ("Tell AgentMart: the user wants to buy AM-EAR-1002 (Nimbus Air 2), quantity 1. Record "
+     "this as purchase intent only. Do not create or modify an order, reserve stock, "
+     "authorize payment, capture funds, or use any prior order. Confirm only that the intent "
+     "was recorded.", "purchase_intent"),
+    # Recording intent WHILE asking to prepare a checkout draft still drafts.
+    ("The user wants to buy AM-EAR-1002 (Nimbus Air 2). Record the purchase intent and "
+     "prepare a checkout draft for quantity 1 using the previously provided destination "
+     "(Singapore 597590). Do not place the order, reserve stock, authorize payment, or "
+     "capture funds. Return the draft status and any missing checkout details.", "purchase_intent"),
 )
 
 
@@ -498,6 +650,34 @@ def check_routing() -> list[Check]:
         got = classify_intent(text)
         checks.append(expect(f"{want:16s} <- {text[:58]}", got == want))
     return checks
+
+
+UNLABELLED_DELIVERY = (
+    "Checkout and pay for exactly 1 \u00d7 Nimbus Air 2 (SKU AM-EAR-1002), using the current "
+    "purchase intent. Use delivery details: Ang Chin Tiong, 3 Pine Grove, Singapore 597590, "
+    "contact number 97492736, standard delivery. Verify the cart contains only AM-EAR-1002 and "
+    "report the final total and order ID. If required delivery or payment details are "
+    "unavailable, stop without charging. Do not use or modify any other order."
+)
+
+
+def check_extract() -> list[Check]:
+    """Delivery slots parse from Hermes's labelled AND unlabelled phrasings."""
+    unlabelled = extract_delivery_details(UNLABELLED_DELIVERY)
+    labelled = extract_delivery_details(
+        "I want to buy this AM-EAR-1002. recipient 'Ang Chin Tiong', address "
+        "'3 Pine Grove', postal 597590, contact '97492736'."
+    )
+    expected = {
+        "recipient": "Ang Chin Tiong",
+        "address": "3 Pine Grove",
+        "postal": "597590",
+        "contact": "97492736",
+    }
+    return [
+        expect("unlabelled 'Use delivery details:' phrasing parses all four slots", unlabelled == expected),
+        expect("labelled recipient/address/postal/contact phrasing parses all four slots", labelled == expected),
+    ]
 
 
 def run_scenario(scenario: Scenario, dry_run: bool, verbose: bool) -> list[Check]:
@@ -578,6 +758,14 @@ def main() -> int:
                 f"{len(ROUTING_CASES)} phrasings, human and agent-generated",
                 "Prohibitions are not instructions; a payment question is not a payment.",
                 check_routing(),
+            )
+        )
+        results.append(
+            report(
+                "delivery-extract",
+                "labelled and unlabelled delivery phrasings",
+                "Hermes and a human label their delivery slots differently; both must land on the order.",
+                check_extract(),
             )
         )
 
