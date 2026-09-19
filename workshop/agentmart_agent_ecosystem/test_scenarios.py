@@ -695,6 +695,20 @@ ROUTING_CASES: tuple[tuple[str, str], ...] = (
      "with exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736. Do not authorize "
      "payment, capture funds, reserve inventory, or place the order. Return whether each field "
      "was persisted and the resulting status.", "purchase_intent"),
+    # An update that labels the recipient as bare "full name:" (no "recipient" word)
+    # is still an UPDATE; checkout/status markers must not hijack it.
+    ("Update draft AM-ORD-20260919-5E3E with these delivery details exactly: full name: David "
+     "Neo; full delivery address: 25 Heng Mui Keng Terrace Singapore; postal code: 119615; "
+     "contact number: 65162093. Confirm whether the update was persisted.", "purchase_intent"),
+    # A retry that confirms a value at the start ("I confirm the recipient's full name is
+    # exactly...") and then updates the existing draft "with recipient name ..." routed to
+    # order_status (no rule matched -> order-id fallback) and never persisted. The trailing
+    # "Then verify and return ..." clause must not downgrade the update either.
+    ("I confirm the recipient\u2019s full name is exactly David Neo. Retry updating the existing "
+     "draft AM-ORD-20260919-5E3E only (do not create a duplicate) with recipient name David Neo, "
+     "full delivery address 25 Heng Mui Keng Terrace Singapore, postal code 119615, and contact "
+     "number 65162093. Then verify and return the exact persisted delivery fields and draft "
+     "status.", "purchase_intent"),
 )
 
 
@@ -756,6 +770,23 @@ def check_extract() -> list[Check]:
         "with exactly: ang chin tiong; 3 pine grove singapore; 597590; 97492736. Do not authorize "
         "payment, capture funds, reserve inventory, or place the order."
     )
+    fullname_label_msg = extract_delivery_details(
+        "Update draft AM-ORD-20260919-5E3E with these delivery details exactly: full name: David "
+        "Neo; full delivery address: 25 Heng Mui Keng Terrace Singapore; postal code: 119615; "
+        "contact number: 65162093."
+    )
+    retry_msg = extract_delivery_details(
+        "I confirm the recipient\u2019s full name is exactly David Neo. Retry updating the existing "
+        "draft AM-ORD-20260919-5E3E only (do not create a duplicate) with recipient name David Neo, "
+        "full delivery address 25 Heng Mui Keng Terrace Singapore, postal code 119615, and contact "
+        "number 65162093. Then verify and return the exact persisted delivery fields and draft status."
+    )
+    fullname_label_expected = {
+        "recipient": "David Neo",
+        "address": "25 Heng Mui Keng Terrace Singapore",
+        "postal": "119615",
+        "contact": "65162093",
+    }
     update_expected = {
         "recipient": "ang chin tiong",
         "address": "3 pine grove",
@@ -776,6 +807,8 @@ def check_extract() -> list[Check]:
         expect("a pure verify lookup extracts nothing to persist", verify_msg == {}),
         expect("'recipient full name:' labelled phrasing parses cleanly", fullname_msg == fullname_expected),
         expect("'with exactly:' positional list parses cleanly despite a leading quote", positional_msg == fullname_expected),
+        expect("bare 'full name:' label parses the recipient", fullname_label_msg == fullname_label_expected),
+        expect("confirm-then-retry update extracts all four slots", retry_msg == fullname_label_expected),
     ]
 
 

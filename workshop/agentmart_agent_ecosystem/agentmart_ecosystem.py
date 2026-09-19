@@ -304,10 +304,10 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # question ("has anything changed with my order?") carries no such clause.
         "purchase_intent",
         re.compile(
-            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,100}\bwith\s+"
-            r"(?:exactly|these|those|the\s+following)\b|"
-            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,80}\bdelivery\s+"
-            r"(?:details|address)\b",
+            r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
+            r"[^.?]{0,200}\bwith\s+(?:exactly|these|those|the\s+following|recipient|delivery|address)\b|"
+            r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b"
+            r"[^.?]{0,120}\bdelivery\s+(?:details|address)\b",
             re.IGNORECASE,
         ),
     ),
@@ -364,10 +364,10 @@ INTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # path, never the charging one.
 "purchase_intent",
         re.compile(
-            r"(?:create|prepare|make|write|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
+            r"(?:creat\w*|prepar\w*|mak\w*|writ\w*|set\s*up)\s+(?:a\s+)?(?:new\s+)?"
             r"(?:payable\s+)?(?:checkout\s+|order\s+)?(?:draft|order)\b|"
-            r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b|"
-            r"(?:update|correct|persist|fix|save|change|refresh|revise|edit)\b[^.?]{0,100}"
+            r"(?:creat\w*|prepar\w*|mak\w*|writ\w*|set\s*up|updat\w*|refresh\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*)\b[^.]{0,80}\bdraft\b|"
+            r"(?:updat\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*|refresh\w*|revis\w*|edit\w*)\b[^.?]{0,100}"
             r"\b(?:with\s+(?:exactly|these|those|the\s+following|the\s+new|delivery)|"
             r"delivery\s+(?:details|address)|recipient|postal|contact\s+number)\b|"
             r"(?:draft|checkout)\s+order\b",
@@ -474,7 +474,7 @@ INTENT_ONLY_BLOCK = re.compile(
     re.IGNORECASE,
 )
 INTENT_ONLY_DRAFT = re.compile(
-    r"(?:create|prepare|make|write|set\s*up|update|refresh|correct|persist|fix|save|change)\b[^.]{0,80}\bdraft\b",
+    r"(?:creat\w*|prepar\w*|mak\w*|writ\w*|set\s*up|updat\w*|refresh\w*|correct\w*|persist\w*|fix\w*|sav\w*|chang\w*)\b[^.]{0,80}\bdraft\b",
     re.IGNORECASE,
 )
 
@@ -603,7 +603,7 @@ def extract_delivery_details(text: str) -> dict[str, str]:
         return value
 
     for slot, keywords in (
-        ("recipient", ("recipient full name", "recipient name", "recipient", "deliver to", "ship to", "send to")),
+        ("recipient", ("recipient full name", "recipient name", "recipient", "full name", "deliver to", "ship to", "send to")),
         ("address", ("delivery address", "address line", "shipping to", "send to", "address")),
         ("contact", ("contact number", "contact", "phone number", "phone")),
         ("postal", ("postal code", "postal", "postcode")),
